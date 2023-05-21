@@ -192,7 +192,7 @@ class BasicAdroitEnv(gym.Env): # , ABC
     def set_env_state(self, state):
         return self._env.set_env_state(state)
     def get_env_state(self):
-        return self._env.get_env_state(state)
+        return self._env.get_env_state()
 
     def evaluate_policy(self, policy,
     					num_episodes=5,
@@ -418,7 +418,7 @@ class BasicFrankaEnv(gym.Env):
     def set_env_state(self, state):
         return self._env.set_env_state(state)
     def get_env_state(self):
-        return self._env.get_env_state(state)
+        return self._env.get_env_state()
 
     def evaluate_policy(self, policy,
     					num_episodes=5,

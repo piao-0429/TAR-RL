@@ -29,6 +29,7 @@ from dm_env import StepType, TimeStep, specs
 import utils
 from logger import Logger
 from replay_buffer import ReplayBufferStorage, make_replay_loader
+from traj_buffer import TrajBufferStorage, make_traj_loader
 from video import TrainVideoRecorder, VideoRecorder
 import joblib
 import pickle
@@ -60,6 +61,14 @@ def make_agent(obs_spec, action_spec, cfg):
     cfg.action_shape = action_spec.shape
     return hydra.utils.instantiate(cfg)
 
+def print_stage1_time_est(time_used, curr_n_update, total_n_update):
+    time_per_update = time_used / curr_n_update
+    est_total_time = time_per_update * total_n_update
+    est_time_remaining = est_total_time - time_used
+    print("Stage 1 [{:.2f}%]. Frames:[{:.0f}/{:.0f}]K. Time:[{:.2f}/{:.2f}]hrs. Overall FPS: {}.".format(
+        curr_n_update / total_n_update * 100, curr_n_update/1000, total_n_update/1000,
+        time_used / 3600, est_total_time / 3600, int(curr_n_update / time_used)))
+
 def print_stage2_time_est(time_used, curr_n_update, total_n_update):
     time_per_update = time_used / curr_n_update
     est_total_time = time_per_update * total_n_update
@@ -87,6 +96,7 @@ class Workspace:
         utils.set_seed_everywhere(cfg.seed)
         self.device = torch.device(cfg.device)
         self.replay_buffer_fetch_every = 1000
+        self.traj_buffer_fetch_every = 50
         if self.cfg.debug > 0: # if debug mode, then change hyperparameters for quick testing
             self.set_debug_hyperparameters()
         self.setup()
@@ -115,6 +125,14 @@ class Workspace:
         self.cfg.agent.hidden_dim = 8
         self.cfg.agent.num_expl_steps = 500
         self.cfg.stage2_eval_every_frames = 50
+        
+        self.cfg.traj_buffer_size = 6
+        self.cfg.traj_batch_size = 2
+        self.cfg.traj_buffer_num_workers = 1
+        self.cfg.seq_len = 10
+        self.traj_buffer_fetch_every = 6
+        self.cfg.stage1_n_update = 10
+        self.cfg.stage1_eval_every_frames = 5
 
     def setup(self):
         warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -152,6 +170,9 @@ class Workspace:
                       specs.Array((1,), np.int8, 'n_goal_achieved'),
                       specs.Array((1,), np.float32, 'time_limit_reached'),
                       )
+            traj_data_specs = (specs.BoundedArray(shape=(self.cfg.seq_len, self.train_env.act_dim), dtype='float32', name='action_seq', minimum=-1.0, maximum=1.0),
+                               specs.Array((1,), np.float32, name='action_label'),
+                      ) 
         else:
             self.train_env = dmc.make(self.cfg.task_name, self.cfg.frame_stack,
                                   self.cfg.action_repeat, self.cfg.seed)
@@ -162,11 +183,12 @@ class Workspace:
                 self.train_env.action_spec(),
                 specs.Array((1,), np.float32, 'reward'),
                 specs.Array((1,), np.float32, 'discount'))
+            traj_data_specs = specs.BoundedArray(shape=(self.cfg.seq_len, self.train_env.act_dim), dtype='float32', name='action_seq', minimum=-1.0, maximum=1.0)
 
         # create replay buffer
         self.replay_storage = ReplayBufferStorage(data_specs, self.work_dir / 'buffer')
 
-
+        self.traj_storage = TrajBufferStorage(traj_data_specs, self.work_dir / 'buffer_traj')
 
         self.replay_loader = make_replay_loader(
             self.work_dir / 'buffer', self.cfg.replay_buffer_size,
@@ -174,6 +196,13 @@ class Workspace:
             self.cfg.save_snapshot, self.cfg.nstep, self.cfg.discount, self.replay_buffer_fetch_every,
             is_adroit=IS_ADROIT)
         self._replay_iter = None
+        
+        # TODO 
+        self.traj_loader = make_traj_loader(
+            self.work_dir / 'buffer_traj', self.cfg.traj_buffer_size,
+            self.cfg.traj_batch_size, self.cfg.traj_buffer_num_workers, self.cfg.seq_len, self.traj_buffer_fetch_every,
+            self.cfg.save_snapshot, is_adroit=IS_ADROIT)
+        self._traj_iter = None
 
         self.video_recorder = VideoRecorder(
             self.work_dir if self.cfg.save_video else None)
@@ -200,6 +229,12 @@ class Workspace:
         if self._replay_iter is None:
             self._replay_iter = iter(self.replay_loader)
         return self._replay_iter
+    
+    @property
+    def traj_iter(self):
+        if self._traj_iter is None:
+            self._traj_iter = iter(self.traj_loader)
+        return self._traj_iter
 
     def eval_dmc(self):
         step, episode, total_reward = 0, 0, 0
@@ -292,7 +327,7 @@ class Workspace:
         demo_path = os.path.join(demo_folder_path, env_name + "_demos.pickle")
         return demo_path
 
-    def load_demo(self, replay_storage, env_name, verbose=True):
+    def load_demo(self, replay_storage, traj_storage, env_name, verbose=True):
         # will load demo data and put them into a replay storage
         demo_path = self.get_demo_path(env_name)
         if verbose:
@@ -320,6 +355,10 @@ class Workspace:
             demo_env.set_env_state(path['init_state_dict'])
             time_step = demo_env.get_current_obs_without_reset()
             replay_storage.add(time_step)
+            time_step_traj = dict()
+            time_step_traj['action_seq'] = path['actions'][-self.cfg.seq_len:].astype(np.float32)
+            time_step_traj['action_label'] = 1.0
+            traj_storage.add(time_step_traj)
 
             ep_reward = 0
             ep_n_goal = 0
@@ -348,28 +387,48 @@ class Workspace:
             if verbose:
                 print('demo trajectory %d, len: %d, return: %.2f, goal achieved steps: %d' %
                       (i_path, len(path['actions']), ep_reward, ep_n_goal))
+                
+        for i in range(self.cfg.traj_buffer_size - self.cfg.num_demo):
+            time_step_traj = dict()
+            time_step_traj['action_seq'] = np.random.uniform(-1, 1, (self.cfg.seq_len, self.train_env.act_dim)).astype(np.float32)
+            time_step_traj['action_label'] = 0
+            traj_storage.add(time_step_traj)
+            
         if verbose:
             print("Demo data load finished, total data count:", total_data_count)
 
-    def get_pretrained_model_path(self, stage1_model_name):
+    def get_pretrained_model_path(self, visual_model_name):
         # given a stage1 model name, return the path to the pretrained model
         data_folder_path = self.get_data_folder_path()
         model_folder_path = os.path.join(data_folder_path, "trained_models")
-        model_path = os.path.join(model_folder_path, stage1_model_name + '_checkpoint.pth.tar')
+        model_path = os.path.join(model_folder_path, visual_model_name + '_checkpoint.pth.tar')
         return model_path
 
     def train(self):
         train_start_time = time.time()
         print("\n=== Training started! ===")
         """=================================== LOAD PRETRAINED MODEL ==================================="""
-        if self.cfg.stage1_use_pretrain:
-            self.agent.load_pretrained_encoder(self.get_pretrained_model_path(self.cfg.stage1_model_name))
-        self.agent.switch_to_RL_stages()
+        # if self.cfg.stage1_use_pretrain:
+        #     self.agent.load_pretrained_encoder(self.get_pretrained_model_path(self.cfg.visual_model_name))
+        # self.agent.switch_to_RL_stages()
 
         """========================================= LOAD DATA ========================================="""
         if self.cfg.load_demo:
-            self.load_demo(self.replay_storage, self.cfg.task_name)
+            self.load_demo(self.replay_storage, self.traj_storage, self.cfg.task_name)
         print("Model and data loading finished in %.2f hours." % ((time.time()-train_start_time) / 3600))
+        
+        """========================================== STAGE 1 =========================================="""
+        print("\n=== Stage 1 started ===")
+        stage1_start_time = time.time()
+        stage1_n_update = self.cfg.stage1_n_update
+        if stage1_n_update > 0:
+            for i_stage1 in range(stage1_n_update):
+                metrics = self.agent.update_representation(self.replay_iter, self.traj_iter, i_stage1, use_sensor=IS_ADROIT)
+                if i_stage1 % self.cfg.stage1_eval_every_frames == 0:
+                    print('Stage 1 step %d, reconstruction loss: %.2f, classification loss: %.2f, alignment loss: %.2f' %
+                          (i_stage1, metrics['loss_rec'],  metrics['loss_cls'], metrics['loss_aln']))
+                if self.cfg.show_computation_time_est and i_stage1 > 0 and i_stage1 % self.cfg.show_time_est_interval == 0:
+                    print_stage1_time_est(time.time()-stage1_start_time, i_stage1+1, stage1_n_update)
 
         """========================================== STAGE 2 =========================================="""
         print("\n=== Stage 2 started ===")
@@ -377,7 +436,7 @@ class Workspace:
         stage2_n_update = self.cfg.stage2_n_update
         if stage2_n_update > 0:
             for i_stage2 in range(stage2_n_update):
-                metrics = self.agent.update(self.replay_iter, i_stage2, stage=2, use_sensor=IS_ADROIT)
+                metrics = self.agent.update(self.replay_iter, i_stage2, stage='BC', use_sensor=IS_ADROIT)
                 if i_stage2 % self.cfg.stage2_eval_every_frames == 0:
                     average_score, succ_rate = self.eval_adroit(force_number_episodes=self.cfg.stage2_num_eval_episodes,
                                                                 do_log=False)
@@ -387,107 +446,107 @@ class Workspace:
                     print_stage2_time_est(time.time()-stage2_start_time, i_stage2+1, stage2_n_update)
         print("Stage 2 finished in %.2f hours." % ((time.time()-stage2_start_time) / 3600))
 
-        """========================================== STAGE 3 =========================================="""
-        print("\n=== Stage 3 started ===")
-        stage3_start_time = time.time()
-        # predicates
-        train_until_step = utils.Until(self.cfg.num_train_frames, self.cfg.action_repeat)
-        seed_until_step = utils.Until(self.cfg.num_seed_frames, self.cfg.action_repeat)
-        eval_every_step = utils.Every(self.cfg.eval_every_frames, self.cfg.action_repeat)
+        # """========================================== STAGE 3 =========================================="""
+        # print("\n=== Stage 3 started ===")
+        # stage3_start_time = time.time()
+        # # predicates
+        # train_until_step = utils.Until(self.cfg.num_train_frames, self.cfg.action_repeat)
+        # seed_until_step = utils.Until(self.cfg.num_seed_frames, self.cfg.action_repeat)
+        # eval_every_step = utils.Every(self.cfg.eval_every_frames, self.cfg.action_repeat)
 
-        episode_step, episode_reward = 0, 0
-        time_step = self.train_env.reset()
-        self.replay_storage.add(time_step)
-        self.train_video_recorder.init(time_step.observation)
-        metrics = None
+        # episode_step, episode_reward = 0, 0
+        # time_step = self.train_env.reset()
+        # self.replay_storage.add(time_step)
+        # self.train_video_recorder.init(time_step.observation)
+        # metrics = None
 
-        episode_step_since_log, episode_reward_list, episode_frame_list = 0, [0], [0]
-        self.timer.reset()
-        while train_until_step(self.global_step):
-            # if 1000 steps passed, do some logging
-            if self.global_step % 1000 == 0 and metrics is not None:
-                elapsed_time, total_time = self.timer.reset()
-                episode_frame_since_log = episode_step_since_log * self.cfg.action_repeat
-                with self.logger.log_and_dump_ctx(self.global_frame, ty='train') as log:
-                        log('fps', episode_frame_since_log / elapsed_time)
-                        log('total_time', total_time)
-                        log('episode_reward', np.mean(episode_reward_list))
-                        log('episode_length', np.mean(episode_frame_list))
-                        log('episode', self.global_episode)
-                        log('buffer_size', len(self.replay_storage))
-                        log('step', self.global_step)
-                episode_step_since_log, episode_reward_list, episode_frame_list = 0, [0], [0]
-            if self.cfg.show_computation_time_est and self.global_step > 0 and self.global_step % self.cfg.show_time_est_interval == 0:
-                print_stage3_time_est(time.time() - stage3_start_time, self.global_frame + 1, self.cfg.num_train_frames)
+        # episode_step_since_log, episode_reward_list, episode_frame_list = 0, [0], [0]
+        # self.timer.reset()
+        # while train_until_step(self.global_step):
+        #     # if 1000 steps passed, do some logging
+        #     if self.global_step % 1000 == 0 and metrics is not None:
+        #         elapsed_time, total_time = self.timer.reset()
+        #         episode_frame_since_log = episode_step_since_log * self.cfg.action_repeat
+        #         with self.logger.log_and_dump_ctx(self.global_frame, ty='train') as log:
+        #                 log('fps', episode_frame_since_log / elapsed_time)
+        #                 log('total_time', total_time)
+        #                 log('episode_reward', np.mean(episode_reward_list))
+        #                 log('episode_length', np.mean(episode_frame_list))
+        #                 log('episode', self.global_episode)
+        #                 log('buffer_size', len(self.replay_storage))
+        #                 log('step', self.global_step)
+        #         episode_step_since_log, episode_reward_list, episode_frame_list = 0, [0], [0]
+        #     if self.cfg.show_computation_time_est and self.global_step > 0 and self.global_step % self.cfg.show_time_est_interval == 0:
+        #         print_stage3_time_est(time.time() - stage3_start_time, self.global_frame + 1, self.cfg.num_train_frames)
 
-            # if reached end of episode
-            if time_step.last():
-                self._global_episode += 1
-                self.train_video_recorder.save(f'{self.global_frame}.mp4')
-                # wait until all the metrics schema is populated
-                if metrics is not None:
-                    # log stats
-                    episode_step_since_log += episode_step
-                    episode_reward_list.append(episode_reward)
-                    episode_frame = episode_step * self.cfg.action_repeat
-                    episode_frame_list.append(episode_frame)
+        #     # if reached end of episode
+        #     if time_step.last():
+        #         self._global_episode += 1
+        #         self.train_video_recorder.save(f'{self.global_frame}.mp4')
+        #         # wait until all the metrics schema is populated
+        #         if metrics is not None:
+        #             # log stats
+        #             episode_step_since_log += episode_step
+        #             episode_reward_list.append(episode_reward)
+        #             episode_frame = episode_step * self.cfg.action_repeat
+        #             episode_frame_list.append(episode_frame)
 
-                # reset env
-                time_step = self.train_env.reset()
-                self.replay_storage.add(time_step)
-                self.train_video_recorder.init(time_step.observation)
-                # try to save snapshot
-                if self.cfg.save_snapshot:
-                    self.save_snapshot()
-                episode_step, episode_reward = 0, 0
+        #         # reset env
+        #         time_step = self.train_env.reset()
+        #         self.replay_storage.add(time_step)
+        #         self.train_video_recorder.init(time_step.observation)
+        #         # try to save snapshot
+        #         if self.cfg.save_snapshot:
+        #             self.save_snapshot()
+        #         episode_step, episode_reward = 0, 0
 
-            # try to evaluate
-            if eval_every_step(self.global_step):
-                self.logger.log('eval_total_time', self.timer.total_time(), self.global_frame)
-                self.eval_adroit()
+        #     # try to evaluate
+        #     if eval_every_step(self.global_step):
+        #         self.logger.log('eval_total_time', self.timer.total_time(), self.global_frame)
+        #         self.eval_adroit()
 
-            # sample action
-            if IS_ADROIT:
-                obs_sensor = time_step.observation_sensor
-            else:
-                obs_sensor = None
-            with torch.no_grad(), utils.eval_mode(self.agent):
-                action = self.agent.act(time_step.observation,
-                                    self.global_step,
-                                    eval_mode=False,
-                                    obs_sensor=obs_sensor)
+        #     # sample action
+        #     if IS_ADROIT:
+        #         obs_sensor = time_step.observation_sensor
+        #     else:
+        #         obs_sensor = None
+        #     with torch.no_grad(), utils.eval_mode(self.agent):
+        #         action = self.agent.act(time_step.observation,
+        #                             self.global_step,
+        #                             eval_mode=False,
+        #                             obs_sensor=obs_sensor)
 
-            # update the agent
-            if not seed_until_step(self.global_step):
-                metrics = self.agent.update(self.replay_iter, self.global_step, stage=3, use_sensor=IS_ADROIT)
-                self.logger.log_metrics(metrics, self.global_frame, ty='train')
+        #     # update the agent
+        #     if not seed_until_step(self.global_step):
+        #         metrics = self.agent.update(self.replay_iter, self.global_step, stage='DAPG', use_sensor=IS_ADROIT)
+        #         self.logger.log_metrics(metrics, self.global_frame, ty='train')
 
-            # take env step
-            time_step = self.train_env.step(action)
-            episode_reward += time_step.reward
-            self.replay_storage.add(time_step)
-            self.train_video_recorder.record(time_step.observation)
-            episode_step += 1
-            self._global_step += 1
-            """here we move the experiment files to azure blob"""
-            if (self.global_step==1) or (self.global_step == 10000) or (self.global_step % 100000 == 0):
-                try:
-                    self.copy_to_azure()
-                except Exception as e:
-                    print(e)
+        #     # take env step
+        #     time_step = self.train_env.step(action)
+        #     episode_reward += time_step.reward
+        #     self.replay_storage.add(time_step)
+        #     self.train_video_recorder.record(time_step.observation)
+        #     episode_step += 1
+        #     self._global_step += 1
+        #     """here we move the experiment files to azure blob"""
+        #     if (self.global_step==1) or (self.global_step == 10000) or (self.global_step % 100000 == 0):
+        #         try:
+        #             self.copy_to_azure()
+        #         except Exception as e:
+        #             print(e)
 
-            """here save model for later"""
-            if self.cfg.save_models:
-                if self.global_frame in (2, 100000, 500000, 1000000, 2000000, 4000000):
-                    self.save_snapshot(suffix=str(self.global_frame))
+        #     """here save model for later"""
+        #     if self.cfg.save_models:
+        #         if self.global_frame in (2, 100000, 500000, 1000000, 2000000, 4000000):
+        #             self.save_snapshot(suffix=str(self.global_frame))
 
-        try:
-            self.copy_to_azure()
-        except Exception as e:
-            print(e)
-        print("Stage 3 finished in %.2f hours." % ((time.time()-stage3_start_time) / 3600))
-        print("All stages finished in %.2f hrs. Work dir:" % ((time.time()-train_start_time)/3600))
-        print(self.work_dir)
+        # try:
+        #     self.copy_to_azure()
+        # except Exception as e:
+        #     print(e)
+        # print("Stage 3 finished in %.2f hours." % ((time.time()-stage3_start_time) / 3600))
+        # print("All stages finished in %.2f hrs. Work dir:" % ((time.time()-train_start_time)/3600))
+        # print(self.work_dir)
 
     def save_snapshot(self, suffix=None):
         if suffix is None:
@@ -521,7 +580,7 @@ class Workspace:
         #     amlt_path_to = '/vrl3data/logs'
         #     copy_tree(str(container_log_path), amlt_path_to, update=1)
 
-@hydra.main(config_path='cfgs_adroit', config_name='config')
+@hydra.main(config_path='cfgs_adroit', config_name='config_tar')
 def main(cfg):
     # TODO potentially check the task name and decide which libs to load here? 
     W = Workspace

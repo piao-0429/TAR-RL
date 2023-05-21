@@ -4,8 +4,8 @@
 import os
 # make sure mujoco and nvidia will be found
 os.environ['LD_LIBRARY_PATH'] = os.environ.get('LD_LIBRARY_PATH', '') + \
-                                ':/workspace/.mujoco/mujoco210/bin:/usr/local/nvidia/lib:/usr/lib/nvidia'
-os.environ['MUJOCO_PY_MUJOCO_PATH'] = '/workspace/.mujoco/mujoco210/'
+                                ':~/.mujoco/mujoco210/bin:/usr/local/nvidia/lib:/usr/lib/nvidia'
+os.environ['MUJOCO_PY_MUJOCO_PATH'] = '~/.mujoco/mujoco210/'
 os.environ['MUJOCO_GL'] = 'egl'
 # set to glfw if trying to render locally with a monitor
 # os.environ['MUJOCO_GL'] = 'glfw'

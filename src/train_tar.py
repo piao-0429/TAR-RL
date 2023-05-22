@@ -4,8 +4,8 @@
 import os, psutil
 # make sure mujoco and nvidia will be found
 os.environ['LD_LIBRARY_PATH'] = os.environ.get('LD_LIBRARY_PATH', '') + \
-                                ':/home/puhua/.mujoco/mujoco210/bin:/usr/local/nvidia/lib:/usr/lib/nvidia'
-os.environ['MUJOCO_PY_MUJOCO_PATH'] = '/home/puhua/.mujoco/mujoco210/'
+                                ':/home/hp/.mujoco/mujoco210/bin:/usr/local/nvidia/lib:/usr/lib/nvidia'
+os.environ['MUJOCO_PY_MUJOCO_PATH'] = '/home/hp/.mujoco/mujoco210/'
 import numpy as np
 import shutil
 import warnings
@@ -183,7 +183,9 @@ class Workspace:
                 self.train_env.action_spec(),
                 specs.Array((1,), np.float32, 'reward'),
                 specs.Array((1,), np.float32, 'discount'))
-            traj_data_specs = specs.BoundedArray(shape=(self.cfg.seq_len, self.train_env.act_dim), dtype='float32', name='action_seq', minimum=-1.0, maximum=1.0)
+            traj_data_specs = (specs.BoundedArray(shape=(self.cfg.seq_len, self.train_env.act_dim), dtype='float32', name='action_seq', minimum=-1.0, maximum=1.0),
+                               specs.Array((1,), np.float32, name='action_label'),
+                      )
 
         # create replay buffer
         self.replay_storage = ReplayBufferStorage(data_specs, self.work_dir / 'buffer')
@@ -430,21 +432,21 @@ class Workspace:
                 if self.cfg.show_computation_time_est and i_stage1 > 0 and i_stage1 % self.cfg.show_time_est_interval == 0:
                     print_stage1_time_est(time.time()-stage1_start_time, i_stage1+1, stage1_n_update)
 
-        """========================================== STAGE 2 =========================================="""
-        print("\n=== Stage 2 started ===")
-        stage2_start_time = time.time()
-        stage2_n_update = self.cfg.stage2_n_update
-        if stage2_n_update > 0:
-            for i_stage2 in range(stage2_n_update):
-                metrics = self.agent.update(self.replay_iter, i_stage2, stage='BC', use_sensor=IS_ADROIT)
-                if i_stage2 % self.cfg.stage2_eval_every_frames == 0:
-                    average_score, succ_rate = self.eval_adroit(force_number_episodes=self.cfg.stage2_num_eval_episodes,
-                                                                do_log=False)
-                    print('Stage 2 step %d, Q(s,a): %.2f, Q loss: %.2f, score: %.2f, succ rate: %.2f' %
-                          (i_stage2, metrics['critic_q1'],  metrics['critic_loss'], average_score, succ_rate))
-                if self.cfg.show_computation_time_est and i_stage2 > 0 and i_stage2 % self.cfg.show_time_est_interval == 0:
-                    print_stage2_time_est(time.time()-stage2_start_time, i_stage2+1, stage2_n_update)
-        print("Stage 2 finished in %.2f hours." % ((time.time()-stage2_start_time) / 3600))
+        # """========================================== STAGE 2 =========================================="""
+        # print("\n=== Stage 2 started ===")
+        # stage2_start_time = time.time()
+        # stage2_n_update = self.cfg.stage2_n_update
+        # if stage2_n_update > 0:
+        #     for i_stage2 in range(stage2_n_update):
+        #         metrics = self.agent.update(self.replay_iter, i_stage2, stage='BC', use_sensor=IS_ADROIT)
+        #         if i_stage2 % self.cfg.stage2_eval_every_frames == 0:
+        #             average_score, succ_rate = self.eval_adroit(force_number_episodes=self.cfg.stage2_num_eval_episodes,
+        #                                                         do_log=False)
+        #             print('Stage 2 step %d, Q(s,a): %.2f, Q loss: %.2f, score: %.2f, succ rate: %.2f' %
+        #                   (i_stage2, metrics['critic_q1'],  metrics['critic_loss'], average_score, succ_rate))
+        #         if self.cfg.show_computation_time_est and i_stage2 > 0 and i_stage2 % self.cfg.show_time_est_interval == 0:
+        #             print_stage2_time_est(time.time()-stage2_start_time, i_stage2+1, stage2_n_update)
+        # print("Stage 2 finished in %.2f hours." % ((time.time()-stage2_start_time) / 3600))
 
         # """========================================== STAGE 3 =========================================="""
         # print("\n=== Stage 3 started ===")

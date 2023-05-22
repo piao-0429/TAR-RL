@@ -41,7 +41,7 @@ save_video: false
 save_train_video: false
 use_tb: false
 save_models: false
-local_data_dir: '/home/puhua/TAR-RL/data'
+local_data_dir: '/home/hp/TAR-RL/data'
 show_computation_time_est: true # provide estimates on computation times
 show_time_est_interval: 2500
 # experiment

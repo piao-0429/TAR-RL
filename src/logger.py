@@ -11,6 +11,7 @@ import torch
 import torchvision
 from termcolor import colored
 from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 COMMON_TRAIN_FORMAT = [('frame', 'F', 'int'), ('step', 'S', 'int'),
                        ('episode', 'E', 'int'), ('episode_length', 'L', 'int'),
@@ -123,8 +124,10 @@ class MetersGroup(object):
 
 
 class Logger(object):
-    def __init__(self, log_dir, use_tb, stage2_logger=False):
+    def __init__(self, project_id, exp_id, log_dir, use_wb, use_tb, stage2_logger=False):
         self._log_dir = log_dir
+        self.use_wb = use_wb
+        self.use_tb = use_tb
         if not stage2_logger:
             self._train_mg = MetersGroup(log_dir / 'train.csv',
                                          formating=COMMON_TRAIN_FORMAT)
@@ -135,20 +138,25 @@ class Logger(object):
                                          formating=COMMON_TRAIN_FORMAT)
             self._eval_mg = MetersGroup(log_dir / 'eval_stage2.csv',
                                         formating=COMMON_EVAL_FORMAT)
+        if use_wb:
+            wandb.init(project=project_id, dir=str(log_dir), id=exp_id)
+            
         if use_tb:
             self._sw = SummaryWriter(str(log_dir / 'tb'))
         else:
             self._sw = None
 
-    def _try_sw_log(self, key, value, step):
+    def _try_log(self, key, value, step):
         if self._sw is not None:
             self._sw.add_scalar(key, value, step)
+        if self.use_wb:
+            wandb.log({key: value}, step=step)
 
     def log(self, key, value, step):
         assert key.startswith('train') or key.startswith('eval')
         if type(value) == torch.Tensor:
             value = value.item()
-        self._try_sw_log(key, value, step)
+        self._try_log(key, value, step)
         mg = self._train_mg if key.startswith('train') else self._eval_mg
         mg.log(key, value)
 

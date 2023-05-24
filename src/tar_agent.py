@@ -211,7 +211,7 @@ class LatentCritic(nn.Module):
 class TARAgent:
     def __init__(self, obs_shape, action_shape, act_rep_dim, seq_len, device, use_sensor, lr, feature_dim, hidden_dim,
                  cls_weight, aln_weight, critic_target_tau, num_expl_steps,
-                 update_every_steps, stddev_clip, use_tb, use_data_aug, encoder_lr_scale,
+                 update_every_steps, stddev_clip, use_wb, use_data_aug, encoder_lr_scale,
                  visual_model_name, safe_q_target_factor, safe_q_threshold, pretanh_penalty, pretanh_threshold,
                  stage2_update_encoder, cql_weight, cql_temp, cql_n_random, stage2_std, stage2_bc_weight,
                  stage3_update_encoder, std0, std1, std_n_decay,
@@ -219,7 +219,7 @@ class TARAgent:
         self.device = device
         self.critic_target_tau = critic_target_tau
         self.update_every_steps = update_every_steps
-        self.use_tb = use_tb
+        self.use_wb = use_wb
         self.num_expl_steps = num_expl_steps
 
         self.stage2_std = stage2_std

@@ -19,7 +19,7 @@ discount: 0.99
 # eval
 eval_every_frames: 50000
 num_eval_episodes: 25
-stage1_eval_every_frames: 5000
+stage1_eval_every_frames: 50
 stage2_eval_every_frames: 5000
 stage2_num_eval_episodes: 5
 # snapshot
@@ -33,19 +33,21 @@ batch_size: 256
 traj_buffer_size: 50
 seq_len: 200
 traj_batch_size: 8
-traj_buffer_num_workers: 1
+traj_buffer_num_workers: 2
 # misc
 seed: 1
 device: cuda
 save_video: false
 save_train_video: false
+use_wb: true
 use_tb: false
 save_models: false
 local_data_dir: '/home/hp/TAR-RL/data'
 show_computation_time_est: true # provide estimates on computation times
-show_time_est_interval: 2500
+show_time_est_interval: 50
 # experiment
-experiment: exp
+project: TAR-RL-door
+experiment: test_stage1
 # environment
 env_feature_type: 'pixels'
 use_sensor: true
@@ -56,7 +58,7 @@ feature_dim: 50
 
 # ====== stage 1 ======
 visual_model_name: 'r3m50' # model name example: resnet6_32channel, resnet6_64channel, resnet10_32channel
-stage1_n_update: 1000000
+stage1_n_update: 1000
 
 # ====== stage 2 ======
 load_demo: true
@@ -73,7 +75,7 @@ agent:
   device: ${device}
   critic_target_tau: 0.01
   update_every_steps: 2
-  use_tb: ${use_tb}
+  use_wb: ${use_wb}
   lr: 1e-4
   hidden_dim: 1024
   feature_dim: 50

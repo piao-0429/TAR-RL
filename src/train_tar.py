@@ -141,7 +141,7 @@ class Workspace:
             assert self.cfg.action_repeat % 2 == 0
 
         # create logger
-        self.logger = Logger(self.work_dir, use_tb=self.cfg.use_tb)
+        self.logger = Logger(self.cfg.project, self.cfg.experiment+'-'+str(self.cfg.seed), self.work_dir, use_wb=self.cfg.use_wb, use_tb=self.cfg.use_tb)
         env_name = self.cfg.task_name
         env_type = 'adroit' if env_name in ('hammer-v0','door-v0','pen-v0','relocate-v0') else 'dmc'
         # assert env_name in ('hammer-v0','door-v0','pen-v0','relocate-v0',)
@@ -426,6 +426,7 @@ class Workspace:
         if stage1_n_update > 0:
             for i_stage1 in range(stage1_n_update):
                 metrics = self.agent.update_representation(self.replay_iter, self.traj_iter, i_stage1, use_sensor=IS_ADROIT)
+                self.logger.log_metrics(metrics, i_stage1, ty='train')
                 if i_stage1 % self.cfg.stage1_eval_every_frames == 0:
                     print('Stage 1 step %d, reconstruction loss: %.2f, classification loss: %.2f, alignment loss: %.2f' %
                           (i_stage1, metrics['loss_rec'],  metrics['loss_cls'], metrics['loss_aln']))

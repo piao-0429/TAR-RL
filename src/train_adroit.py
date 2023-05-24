@@ -123,7 +123,7 @@ class Workspace:
             assert self.cfg.action_repeat % 2 == 0
 
         # create logger
-        self.logger = Logger(self.work_dir, use_tb=self.cfg.use_tb)
+        self.logger = Logger(self.work_dir, use_wb=self.cfg.use_wb)
         env_name = self.cfg.task_name
         env_type = 'adroit' if env_name in ('hammer-v0','door-v0','pen-v0','relocate-v0') else 'dmc'
         # assert env_name in ('hammer-v0','door-v0','pen-v0','relocate-v0',)

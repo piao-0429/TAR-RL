@@ -120,19 +120,22 @@ class Workspace:
         self.cfg.num_train_frames = 5050
         self.replay_buffer_fetch_every = 30
         self.cfg.stage2_n_update = 100
-        self.cfg.num_demo = 3
+        self.cfg.num_demo = 1
         self.cfg.eval_every_frames = 3000
         self.cfg.agent.hidden_dim = 8
         self.cfg.agent.num_expl_steps = 500
         self.cfg.stage2_eval_every_frames = 50
         
-        self.cfg.traj_buffer_size = 6
+        self.cfg.traj_buffer_size = 2
         self.cfg.traj_batch_size = 2
         self.cfg.traj_buffer_num_workers = 1
         self.cfg.seq_len = 10
-        self.traj_buffer_fetch_every = 6
+        self.traj_buffer_fetch_every = 2
         self.cfg.stage1_n_update = 10
         self.cfg.stage1_eval_every_frames = 5
+        
+        self.cfg.use_wb = False
+        self.cfg.use_tb = False
 
     def setup(self):
         warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -433,123 +436,123 @@ class Workspace:
                 if self.cfg.show_computation_time_est and i_stage1 > 0 and i_stage1 % self.cfg.show_time_est_interval == 0:
                     print_stage1_time_est(time.time()-stage1_start_time, i_stage1+1, stage1_n_update)
 
-        # """========================================== STAGE 2 =========================================="""
-        # print("\n=== Stage 2 started ===")
-        # stage2_start_time = time.time()
-        # stage2_n_update = self.cfg.stage2_n_update
-        # if stage2_n_update > 0:
-        #     for i_stage2 in range(stage2_n_update):
-        #         metrics = self.agent.update(self.replay_iter, i_stage2, stage='BC', use_sensor=IS_ADROIT)
-        #         if i_stage2 % self.cfg.stage2_eval_every_frames == 0:
-        #             average_score, succ_rate = self.eval_adroit(force_number_episodes=self.cfg.stage2_num_eval_episodes,
-        #                                                         do_log=False)
-        #             print('Stage 2 step %d, Q(s,a): %.2f, Q loss: %.2f, score: %.2f, succ rate: %.2f' %
-        #                   (i_stage2, metrics['critic_q1'],  metrics['critic_loss'], average_score, succ_rate))
-        #         if self.cfg.show_computation_time_est and i_stage2 > 0 and i_stage2 % self.cfg.show_time_est_interval == 0:
-        #             print_stage2_time_est(time.time()-stage2_start_time, i_stage2+1, stage2_n_update)
-        # print("Stage 2 finished in %.2f hours." % ((time.time()-stage2_start_time) / 3600))
+        """========================================== STAGE 2 =========================================="""
+        print("\n=== Stage 2 started ===")
+        stage2_start_time = time.time()
+        stage2_n_update = self.cfg.stage2_n_update
+        if stage2_n_update > 0:
+            for i_stage2 in range(stage2_n_update):
+                metrics = self.agent.update(self.replay_iter, i_stage2, stage='BC', use_sensor=IS_ADROIT)
+                if i_stage2 % self.cfg.stage2_eval_every_frames == 0:
+                    average_score, succ_rate = self.eval_adroit(force_number_episodes=self.cfg.stage2_num_eval_episodes,
+                                                                do_log=False)
+                    print('Stage 2 step %d, Q(s,a): %.2f, Q loss: %.2f, score: %.2f, succ rate: %.2f' %
+                          (i_stage2, metrics['critic_q1'],  metrics['critic_loss'], average_score, succ_rate))
+                if self.cfg.show_computation_time_est and i_stage2 > 0 and i_stage2 % self.cfg.show_time_est_interval == 0:
+                    print_stage2_time_est(time.time()-stage2_start_time, i_stage2+1, stage2_n_update)
+        print("Stage 2 finished in %.2f hours." % ((time.time()-stage2_start_time) / 3600))
 
-        # """========================================== STAGE 3 =========================================="""
-        # print("\n=== Stage 3 started ===")
-        # stage3_start_time = time.time()
-        # # predicates
-        # train_until_step = utils.Until(self.cfg.num_train_frames, self.cfg.action_repeat)
-        # seed_until_step = utils.Until(self.cfg.num_seed_frames, self.cfg.action_repeat)
-        # eval_every_step = utils.Every(self.cfg.eval_every_frames, self.cfg.action_repeat)
+        """========================================== STAGE 3 =========================================="""
+        print("\n=== Stage 3 started ===")
+        stage3_start_time = time.time()
+        # predicates
+        train_until_step = utils.Until(self.cfg.num_train_frames, self.cfg.action_repeat)
+        seed_until_step = utils.Until(self.cfg.num_seed_frames, self.cfg.action_repeat)
+        eval_every_step = utils.Every(self.cfg.eval_every_frames, self.cfg.action_repeat)
 
-        # episode_step, episode_reward = 0, 0
-        # time_step = self.train_env.reset()
-        # self.replay_storage.add(time_step)
-        # self.train_video_recorder.init(time_step.observation)
-        # metrics = None
+        episode_step, episode_reward = 0, 0
+        time_step = self.train_env.reset()
+        self.replay_storage.add(time_step)
+        self.train_video_recorder.init(time_step.observation)
+        metrics = None
 
-        # episode_step_since_log, episode_reward_list, episode_frame_list = 0, [0], [0]
-        # self.timer.reset()
-        # while train_until_step(self.global_step):
-        #     # if 1000 steps passed, do some logging
-        #     if self.global_step % 1000 == 0 and metrics is not None:
-        #         elapsed_time, total_time = self.timer.reset()
-        #         episode_frame_since_log = episode_step_since_log * self.cfg.action_repeat
-        #         with self.logger.log_and_dump_ctx(self.global_frame, ty='train') as log:
-        #                 log('fps', episode_frame_since_log / elapsed_time)
-        #                 log('total_time', total_time)
-        #                 log('episode_reward', np.mean(episode_reward_list))
-        #                 log('episode_length', np.mean(episode_frame_list))
-        #                 log('episode', self.global_episode)
-        #                 log('buffer_size', len(self.replay_storage))
-        #                 log('step', self.global_step)
-        #         episode_step_since_log, episode_reward_list, episode_frame_list = 0, [0], [0]
-        #     if self.cfg.show_computation_time_est and self.global_step > 0 and self.global_step % self.cfg.show_time_est_interval == 0:
-        #         print_stage3_time_est(time.time() - stage3_start_time, self.global_frame + 1, self.cfg.num_train_frames)
+        episode_step_since_log, episode_reward_list, episode_frame_list = 0, [0], [0]
+        self.timer.reset()
+        while train_until_step(self.global_step):
+            # if 1000 steps passed, do some logging
+            if self.global_step % 1000 == 0 and metrics is not None:
+                elapsed_time, total_time = self.timer.reset()
+                episode_frame_since_log = episode_step_since_log * self.cfg.action_repeat
+                with self.logger.log_and_dump_ctx(self.global_frame, ty='train') as log:
+                        log('fps', episode_frame_since_log / elapsed_time)
+                        log('total_time', total_time)
+                        log('episode_reward', np.mean(episode_reward_list))
+                        log('episode_length', np.mean(episode_frame_list))
+                        log('episode', self.global_episode)
+                        log('buffer_size', len(self.replay_storage))
+                        log('step', self.global_step)
+                episode_step_since_log, episode_reward_list, episode_frame_list = 0, [0], [0]
+            if self.cfg.show_computation_time_est and self.global_step > 0 and self.global_step % self.cfg.show_time_est_interval == 0:
+                print_stage3_time_est(time.time() - stage3_start_time, self.global_frame + 1, self.cfg.num_train_frames)
 
-        #     # if reached end of episode
-        #     if time_step.last():
-        #         self._global_episode += 1
-        #         self.train_video_recorder.save(f'{self.global_frame}.mp4')
-        #         # wait until all the metrics schema is populated
-        #         if metrics is not None:
-        #             # log stats
-        #             episode_step_since_log += episode_step
-        #             episode_reward_list.append(episode_reward)
-        #             episode_frame = episode_step * self.cfg.action_repeat
-        #             episode_frame_list.append(episode_frame)
+            # if reached end of episode
+            if time_step.last():
+                self._global_episode += 1
+                self.train_video_recorder.save(f'{self.global_frame}.mp4')
+                # wait until all the metrics schema is populated
+                if metrics is not None:
+                    # log stats
+                    episode_step_since_log += episode_step
+                    episode_reward_list.append(episode_reward)
+                    episode_frame = episode_step * self.cfg.action_repeat
+                    episode_frame_list.append(episode_frame)
 
-        #         # reset env
-        #         time_step = self.train_env.reset()
-        #         self.replay_storage.add(time_step)
-        #         self.train_video_recorder.init(time_step.observation)
-        #         # try to save snapshot
-        #         if self.cfg.save_snapshot:
-        #             self.save_snapshot()
-        #         episode_step, episode_reward = 0, 0
+                # reset env
+                time_step = self.train_env.reset()
+                self.replay_storage.add(time_step)
+                self.train_video_recorder.init(time_step.observation)
+                # try to save snapshot
+                if self.cfg.save_snapshot:
+                    self.save_snapshot()
+                episode_step, episode_reward = 0, 0
 
-        #     # try to evaluate
-        #     if eval_every_step(self.global_step):
-        #         self.logger.log('eval_total_time', self.timer.total_time(), self.global_frame)
-        #         self.eval_adroit()
+            # try to evaluate
+            if eval_every_step(self.global_step):
+                self.logger.log('eval_total_time', self.timer.total_time(), self.global_frame)
+                self.eval_adroit()
 
-        #     # sample action
-        #     if IS_ADROIT:
-        #         obs_sensor = time_step.observation_sensor
-        #     else:
-        #         obs_sensor = None
-        #     with torch.no_grad(), utils.eval_mode(self.agent):
-        #         action = self.agent.act(time_step.observation,
-        #                             self.global_step,
-        #                             eval_mode=False,
-        #                             obs_sensor=obs_sensor)
+            # sample action
+            if IS_ADROIT:
+                obs_sensor = time_step.observation_sensor
+            else:
+                obs_sensor = None
+            with torch.no_grad(), utils.eval_mode(self.agent):
+                action = self.agent.act(time_step.observation,
+                                    self.global_step,
+                                    eval_mode=False,
+                                    obs_sensor=obs_sensor)
 
-        #     # update the agent
-        #     if not seed_until_step(self.global_step):
-        #         metrics = self.agent.update(self.replay_iter, self.global_step, stage='DAPG', use_sensor=IS_ADROIT)
-        #         self.logger.log_metrics(metrics, self.global_frame, ty='train')
+            # update the agent
+            if not seed_until_step(self.global_step):
+                metrics = self.agent.update(self.replay_iter, self.global_step, stage='DAPG', use_sensor=IS_ADROIT)
+                self.logger.log_metrics(metrics, self.global_frame, ty='train')
 
-        #     # take env step
-        #     time_step = self.train_env.step(action)
-        #     episode_reward += time_step.reward
-        #     self.replay_storage.add(time_step)
-        #     self.train_video_recorder.record(time_step.observation)
-        #     episode_step += 1
-        #     self._global_step += 1
-        #     """here we move the experiment files to azure blob"""
-        #     if (self.global_step==1) or (self.global_step == 10000) or (self.global_step % 100000 == 0):
-        #         try:
-        #             self.copy_to_azure()
-        #         except Exception as e:
-        #             print(e)
+            # take env step
+            time_step = self.train_env.step(action)
+            episode_reward += time_step.reward
+            self.replay_storage.add(time_step)
+            self.train_video_recorder.record(time_step.observation)
+            episode_step += 1
+            self._global_step += 1
+            """here we move the experiment files to azure blob"""
+            if (self.global_step==1) or (self.global_step == 10000) or (self.global_step % 100000 == 0):
+                try:
+                    self.copy_to_azure()
+                except Exception as e:
+                    print(e)
 
-        #     """here save model for later"""
-        #     if self.cfg.save_models:
-        #         if self.global_frame in (2, 100000, 500000, 1000000, 2000000, 4000000):
-        #             self.save_snapshot(suffix=str(self.global_frame))
+            """here save model for later"""
+            if self.cfg.save_models:
+                if self.global_frame in (2, 100000, 500000, 1000000, 2000000, 4000000):
+                    self.save_snapshot(suffix=str(self.global_frame))
 
-        # try:
-        #     self.copy_to_azure()
-        # except Exception as e:
-        #     print(e)
-        # print("Stage 3 finished in %.2f hours." % ((time.time()-stage3_start_time) / 3600))
-        # print("All stages finished in %.2f hrs. Work dir:" % ((time.time()-train_start_time)/3600))
-        # print(self.work_dir)
+        try:
+            self.copy_to_azure()
+        except Exception as e:
+            print(e)
+        print("Stage 3 finished in %.2f hours." % ((time.time()-stage3_start_time) / 3600))
+        print("All stages finished in %.2f hrs. Work dir:" % ((time.time()-train_start_time)/3600))
+        print(self.work_dir)
 
     def save_snapshot(self, suffix=None):
         if suffix is None:

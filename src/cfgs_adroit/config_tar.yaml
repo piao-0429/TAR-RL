@@ -47,7 +47,7 @@ show_computation_time_est: true # provide estimates on computation times
 show_time_est_interval: 50
 # experiment
 project: TAR-RL-door
-experiment: test_stage1
+experiment: test_all
 # environment
 env_feature_type: 'pixels'
 use_sensor: true

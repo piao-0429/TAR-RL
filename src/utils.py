@@ -125,6 +125,23 @@ class TruncatedNormal(pyd.Normal):
         x = self.loc + eps
         return self._clamp(x)
 
+class ClampedGaussian(pyd.Normal):
+    def __init__(self, loc, scale, low=-1.0, high=1.0, eps=1e-6):
+        super().__init__(loc, scale, validate_args=False)
+        self.low = low
+        self.high = high
+        self.eps = eps
+
+    def sample(self, clip=None, sample_shape=torch.Size()):
+        shape = self._extended_shape(sample_shape)
+        eps = _standard_normal(shape,
+                               dtype=self.loc.dtype,
+                               device=self.loc.device)
+        eps *= self.scale
+        if clip is not None:
+            eps = torch.clamp(eps, -clip, clip)
+        x = self.loc + eps
+        return x
 
 def schedule(schdl, step):
     try:

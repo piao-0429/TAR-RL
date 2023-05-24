@@ -166,7 +166,8 @@ class LatentActor(nn.Module):
         mu = mu * self.action_scale + self.action_shift
         std = torch.ones_like(mu) * std
 
-        dist = torch.distributions.Normal(mu, std)
+        # dist = torch.distributions.Normal(mu, std)
+        dist = utils.ClampedGaussian(mu, std)
         return dist
 
     def forward_with_pretanh(self, obs, std):
@@ -178,7 +179,8 @@ class LatentActor(nn.Module):
         mu = mu * self.action_scale + self.action_shift
         std = torch.ones_like(mu) * std
         
-        dist = torch.distributions.Normal(mu, std)
+        # dist = torch.distributions.Normal(mu, std)
+        dist = utils.ClampedGaussian(mu, std)
         return dist, pretanh
 
 class LatentCritic(nn.Module):
@@ -319,12 +321,6 @@ class TARAgent:
         self.train()
         self.critic_target.train()
 
-    # def switch_to_RL_stages(self, verbose=True):
-    #     # run convolutional channel expansion to match input shape
-    #     self.encoder.expand_first_layer()
-    #     if verbose:
-    #         print("Convolutional channel expansion finished: now can take in %d images as input." % self.encoder.n_images)
-
     def train(self, training=True):
         self.training = training
         self.encoder.train(training)
@@ -386,9 +382,10 @@ class TARAgent:
         if self.use_data_aug:
             obs = self.aug(obs.float())
             next_obs = self.aug(next_obs.float())
-            
-        ob_rep = self.encoder(obs)
-        ob_rep_next = self.encoder(next_obs)
+        
+        with torch.no_grad():  
+            ob_rep = self.encoder(obs)
+            ob_rep_next = self.encoder(next_obs)
         
         if use_sensor:
             ob_rep = torch.cat([ob_rep, obs_sensor], dim=1)
@@ -429,6 +426,7 @@ class TARAgent:
         # for stage 2 and 3, we use the same functions but with different hyperparameters
         assert stage in ["BC", "DAPG"]
         metrics = dict()
+        self.action_vae.eval()
 
         if stage == "BC":
             update_encoder = self.stage2_update_encoder
@@ -474,6 +472,7 @@ class TARAgent:
 
         with torch.no_grad():
             next_obs = self.encoder(next_obs)
+            action = self.action_vae.encode(action)[0]
 
         # concatenate obs with additional sensor observation if needed
         obs_combined = torch.cat([obs, obs_sensor], dim=1) if obs_sensor is not None else obs
@@ -523,6 +522,7 @@ class TARAgent:
         """
         if conservative_loss_weight > 0:
             random_actions = (torch.rand((batch_size * self.cql_n_random, self.act_dim), device=self.device) - 0.5) * 2
+            random_actions = self.action_vae.encode(random_actions)[0]
 
             dist = self.actor(obs, stddev)
             current_actions = dist.sample(clip=self.stddev_clip)

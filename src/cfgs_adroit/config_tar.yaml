@@ -117,7 +117,7 @@ agent:
   std1: 0.01
   std_n_decay: 500000
   # bc decay
-  stage3_bc_lam0: 0 # ablation shows additional BC does not help performance
+  stage3_bc_lam0: 0.01 # ablation shows additional BC does not help performance
   stage3_bc_lam1: 0.95
 
 hydra:

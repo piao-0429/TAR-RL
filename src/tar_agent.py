@@ -472,18 +472,21 @@ class TARAgent:
 
         with torch.no_grad():
             next_obs = self.encoder(next_obs)
-            action = self.action_vae.encode(action)[0]
+            act_rep = self.action_vae.encode(action)[0]
+            act_rec = self.action_vae.forward(action)[0]
+        
+        metrics['loss_rec_rl'] = F.mse_loss(act_rec, action).item()
 
         # concatenate obs with additional sensor observation if needed
         obs_combined = torch.cat([obs, obs_sensor], dim=1) if obs_sensor is not None else obs
         obs_next_combined = torch.cat([next_obs, obs_sensor_next], dim=1) if obs_sensor_next is not None else next_obs
 
         # update critic
-        metrics.update(self.update_critic(obs_combined, action, reward, discount, obs_next_combined,
+        metrics.update(self.update_critic(obs_combined, act_rep, reward, discount, obs_next_combined,
                                                stddev, update_encoder, conservative_loss_weight))
 
         # update actor, following previous works, we do not use actor gradient for encoder update
-        metrics.update(self.update_actor(obs_combined.detach(), action, stddev, bc_weight,
+        metrics.update(self.update_actor(obs_combined.detach(), act_rep, stddev, bc_weight,
                                               self.pretanh_penalty, self.pretanh_threshold))
 
         metrics['batch_reward'] = reward.mean().item()

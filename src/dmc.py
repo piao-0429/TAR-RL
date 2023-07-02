@@ -209,3 +209,17 @@ def make(name, frame_stack, action_repeat, seed):
     env = FrameStackWrapper(env, frame_stack, pixels_key)
     env = ExtendedTimeStepWrapper(env)
     return env
+
+def get_current_obs_without_reset(env):
+    obs_pixels = env.physics.render(height=84, width=84)
+    obs_pixels = obs_pixels.transpose(2, 0, 1).copy()
+    obs_pixels = np.concatenate([obs_pixels] * env._num_frames, axis=0)
+    action_spec = env.action_spec()
+    action = np.zeros(action_spec.shape, dtype=action_spec.dtype)
+    time_step = ExtendedTimeStep(observation=obs_pixels,
+                                step_type=dm_env.StepType.FIRST,
+                                action=action,
+                                reward=0.0,
+                                discount=1.0)
+    return time_step
+ 

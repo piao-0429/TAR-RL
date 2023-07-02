@@ -6,6 +6,7 @@ import os, psutil
 os.environ['LD_LIBRARY_PATH'] = os.environ.get('LD_LIBRARY_PATH', '') + \
                                 ':/home/hp/.mujoco/mujoco210/bin:/usr/local/nvidia/lib:/usr/lib/nvidia'
 os.environ['MUJOCO_PY_MUJOCO_PATH'] = '/home/hp/.mujoco/mujoco210/'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 import numpy as np
 import shutil
 import warnings
@@ -38,7 +39,7 @@ import time
 torch.backends.cudnn.benchmark = True
 
 # TODO this part can be done during workspace setup
-ENV_TYPE = 'adroit'
+ENV_TYPE = 'dmc'
 if ENV_TYPE == 'adroit':
     import mj_envs
     from mjrl.utils.gym_env import GymEnv
@@ -148,7 +149,7 @@ class Workspace:
         env_name = self.cfg.task_name
         env_type = 'adroit' if env_name in ('hammer-v0','door-v0','pen-v0','relocate-v0') else 'dmc'
         # assert env_name in ('hammer-v0','door-v0','pen-v0','relocate-v0',)
-
+        self.env_type = env_type
         if self.cfg.agent.encoder_lr_scale == 'auto':
             if env_name == 'relocate-v0':
                 self.cfg.agent.encoder_lr_scale = 0.01
@@ -186,14 +187,12 @@ class Workspace:
                 self.train_env.action_spec(),
                 specs.Array((1,), np.float32, 'reward'),
                 specs.Array((1,), np.float32, 'discount'))
-            traj_data_specs = (specs.BoundedArray(shape=(self.cfg.seq_len, self.train_env.act_dim), dtype='float32', name='action_seq', minimum=-1.0, maximum=1.0),
-                               specs.Array((1,), np.float32, name='action_label'),
-                      )
+            traj_data_specs = (specs.BoundedArray(shape=(self.cfg.seq_len, self.train_env.action_spec().shape[0]), dtype='float32', name='action_seq', minimum=-1.0, maximum=1.0),
+                            specs.Array((1,), np.float32, name='action_label'),
+                        )
 
         # create replay buffer
         self.replay_storage = ReplayBufferStorage(data_specs, self.work_dir / 'buffer')
-
-        self.traj_storage = TrajBufferStorage(traj_data_specs, self.work_dir / 'buffer_traj')
 
         self.replay_loader = make_replay_loader(
             self.work_dir / 'buffer', self.cfg.replay_buffer_size,
@@ -202,7 +201,7 @@ class Workspace:
             is_adroit=IS_ADROIT)
         self._replay_iter = None
         
-        # TODO 
+        self.traj_storage = TrajBufferStorage(traj_data_specs, self.work_dir / 'buffer_traj')
         self.traj_loader = make_traj_loader(
             self.work_dir / 'buffer_traj', self.cfg.traj_buffer_size,
             self.cfg.traj_batch_size, self.cfg.traj_buffer_num_workers, self.cfg.seq_len, self.traj_buffer_fetch_every,
@@ -241,7 +240,7 @@ class Workspace:
             self._traj_iter = iter(self.traj_loader)
         return self._traj_iter
 
-    def eval_dmc(self):
+    def eval_dmc(self, do_log=False):
         step, episode, total_reward = 0, 0, 0
         eval_until_episode = utils.Until(self.cfg.num_eval_episodes)
 
@@ -260,16 +259,18 @@ class Workspace:
 
             episode += 1
             self.video_recorder.save(f'{self.global_frame}.mp4')
-
-        with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
-            log('episode_reward', total_reward / episode)
-            log('episode_length', step * self.cfg.action_repeat / episode)
-            log('episode', self.global_episode)
-            log('step', self.global_step)
+        if do_log:
+            with self.logger.log_and_dump_ctx(self.global_frame, ty='eval') as log:
+                log('episode_reward', total_reward / episode)
+                log('episode_length', step * self.cfg.action_repeat / episode)
+                log('episode', self.global_episode)
+                log('step', self.global_step)
+            
+        return total_reward / episode, 0
 
     def eval_adroit(self, force_number_episodes=None, do_log=True):
         if ENV_TYPE != 'adroit':
-            return self.eval_dmc()
+            return self.eval_dmc(do_log)
 
         step, episode, total_reward = 0, 0, 0
         n_eval_episode = force_number_episodes if force_number_episodes is not None else self.cfg.num_eval_episodes
@@ -333,71 +334,112 @@ class Workspace:
         return demo_path
 
     def load_demo(self, replay_storage, traj_storage, env_name, verbose=True):
-        # will load demo data and put them into a replay storage
-        demo_path = self.get_demo_path(env_name)
-        if verbose:
-            print("Trying to get demo data from:", demo_path)
-
-        # get the raw state demo data, a list of length 25
-        demo_data = pickle.load(open(demo_path, 'rb'))
-        if self.cfg.num_demo >= 0:
-            demo_data = demo_data[:self.cfg.num_demo]
-
-        """
-        the adroit demo data is in raw state, so we need to convert them into image data
-        we init an env and run episodes with the stored actions in the demo data
-        then put the image and sensor data into the replay buffer, also need to clip actions here 
-        this part is basically following the RRL code
-        """
-        demo_env = AdroitEnv(env_name, test_image=False, num_repeats=1, num_frames=self.cfg.frame_stack,
-                env_feature_type=self.env_feature_type, device=self.device, reward_rescale=self.cfg.reward_rescale)
-        demo_env.reset()
-
-        total_data_count = 0
-        for i_path in range(len(demo_data)):
-            path = demo_data[i_path]
-            demo_env.reset()
-            demo_env.set_env_state(path['init_state_dict'])
-            time_step = demo_env.get_current_obs_without_reset()
-            replay_storage.add(time_step)
-            time_step_traj = dict()
-            time_step_traj['action_seq'] = path['actions'][-self.cfg.seq_len:].astype(np.float32)
-            time_step_traj['action_label'] = 1.0
-            traj_storage.add(time_step_traj)
-
-            ep_reward = 0
-            ep_n_goal = 0
-            for i_act in range(len(path['actions'])):
-                total_data_count += 1
-                action = path['actions'][i_act]
-                action = action.astype(np.float32)
-                # when action is put into the environment, they will be clipped.
-                action[action > 1] = 1
-                action[action < -1] = -1
-
-                # when they collect the demo data, they actually did not use a timelimit...
-                if i_act == len(path['actions']) - 1:
-                    force_step_type = 'last'
-                else:
-                    force_step_type = 'mid'
-
-                time_step = demo_env.step(action, force_step_type=force_step_type)
-                replay_storage.add(time_step)
-
-                reward = time_step.reward
-                ep_reward += reward
-
-                goal_achieved = time_step.n_goal_achieved
-                ep_n_goal += goal_achieved
+        if self.env_type == 'adroit':
+            # will load demo data and put them into a replay storage
+            demo_path = self.get_demo_path(env_name)
             if verbose:
-                print('demo trajectory %d, len: %d, return: %.2f, goal achieved steps: %d' %
-                      (i_path, len(path['actions']), ep_reward, ep_n_goal))
+                print("Trying to get demo data from:", demo_path)
+
+            # get the raw state demo data, a list of length 25
+            demo_data = pickle.load(open(demo_path, 'rb'))
+            if self.cfg.num_demo >= 0:
+                demo_data = demo_data[:self.cfg.num_demo]
+
+            """
+            the adroit demo data is in raw state, so we need to convert them into image data
+            we init an env and run episodes with the stored actions in the demo data
+            then put the image and sensor data into the replay buffer, also need to clip actions here 
+            this part is basically following the RRL code
+            """
+            demo_env = AdroitEnv(env_name, test_image=False, num_repeats=1, num_frames=self.cfg.frame_stack,
+                    env_feature_type=self.env_feature_type, device=self.device, reward_rescale=self.cfg.reward_rescale)
+            demo_env.reset()
+
+            total_data_count = 0
+            for i_path in range(len(demo_data)):
+                path = demo_data[i_path]
+                demo_env.reset()
+                demo_env.set_env_state(path['init_state_dict'])
+                time_step = demo_env.get_current_obs_without_reset()
+                replay_storage.add(time_step)
+                time_step_traj = dict()
+                time_step_traj['action_seq'] = path['actions'][-self.cfg.seq_len:].astype(np.float32)
+                time_step_traj['action_label'] = 1.0
+                traj_storage.add(time_step_traj)
+
+                ep_reward = 0
+                ep_n_goal = 0
+                for i_act in range(len(path['actions'])):
+                    total_data_count += 1
+                    action = path['actions'][i_act]
+                    action = action.astype(np.float32)
+                    # when action is put into the environment, they will be clipped.
+                    action[action > 1] = 1
+                    action[action < -1] = -1
+
+                    # when they collect the demo data, they actually did not use a timelimit...
+                    if i_act == len(path['actions']) - 1:
+                        force_step_type = 'last'
+                    else:
+                        force_step_type = 'mid'
+
+                    time_step = demo_env.step(action, force_step_type=force_step_type)
+                    replay_storage.add(time_step)
+
+                    reward = time_step.reward
+                    ep_reward += reward
+
+                    goal_achieved = time_step.n_goal_achieved
+                    ep_n_goal += goal_achieved
+                if verbose:
+                    print('demo trajectory %d, len: %d, return: %.2f, goal achieved steps: %d' %
+                        (i_path, len(path['actions']), ep_reward, ep_n_goal))
+            for i in range(self.cfg.traj_buffer_size - self.cfg.num_demo):
+                time_step_traj = dict()
+                time_step_traj['action_seq'] = np.random.uniform(-1, 1, (self.cfg.seq_len, self.train_env.act_dim)).astype(np.float32)
+                time_step_traj['action_label'] = 0
+                traj_storage.add(time_step_traj)
+        else:
+            total_data_count = 0
+            data_folder_path = self.get_data_folder_path()
+            pt_path = data_folder_path + '/ckpts/' + self.cfg.task_name + '/' + str(self.cfg.seed) + '/checkpoint-1000000.pt'
+            agent = torch.load(pt_path)
+            
+            for i_demo in range(self.cfg.num_demo):
+                demo_env = dmc.make(self.cfg.task_name, self.cfg.frame_stack,
+                                self.cfg.action_repeat, self.cfg.seed + i_demo)
+                action_shape = demo_env.action_spec().shape[0]
+                total_reward = 0
+                step = 0
+                actions = np.zeros((int(1000/self.cfg.action_repeat), action_shape), dtype=np.float64)
                 
-        for i in range(self.cfg.traj_buffer_size - self.cfg.num_demo):
-            time_step_traj = dict()
-            time_step_traj['action_seq'] = np.random.uniform(-1, 1, (self.cfg.seq_len, self.train_env.act_dim)).astype(np.float32)
-            time_step_traj['action_label'] = 0
-            traj_storage.add(time_step_traj)
+                time_step = demo_env.reset()
+                replay_storage.add(time_step)
+                while not time_step.last():
+                    with torch.no_grad(), utils.eval_mode(agent):
+                        # observations[step] = time_step.observation
+                        action = agent.act(time_step.observation,
+                                                5000,
+                                                eval_mode=True)
+                        actions[step] = action
+                    time_step = demo_env.step(action)
+                    replay_storage.add(time_step)
+                    total_reward += time_step.reward
+                    step += 1
+                    total_data_count += 1
+                time_step_traj = dict()
+                time_step_traj['action_seq'] = actions[-self.cfg.seq_len:].astype(np.float32)
+                time_step_traj['action_label'] = 1.0
+                traj_storage.add(time_step_traj)
+                if verbose:
+                    print('demo trajectory %d, len: %d, return: %.2f' %
+                        (i_demo, step, total_reward))
+            for i in range(self.cfg.traj_buffer_size - self.cfg.num_demo):
+                time_step_traj = dict()
+                time_step_traj['action_seq'] = np.random.uniform(-1, 1, (self.cfg.seq_len, self.train_env.action_spec().shape[0])).astype(np.float32)
+                time_step_traj['action_label'] = 0
+                traj_storage.add(time_step_traj)        
+            
             
         if verbose:
             print("Demo data load finished, total data count:", total_data_count)
@@ -586,7 +628,7 @@ class Workspace:
         #     amlt_path_to = '/vrl3data/logs'
         #     copy_tree(str(container_log_path), amlt_path_to, update=1)
 
-@hydra.main(config_path='cfgs_adroit', config_name='config_tar')
+@hydra.main(config_path='cfgs', config_name='config_tar_'+ENV_TYPE)
 def main(cfg):
     # TODO potentially check the task name and decide which libs to load here? 
     W = Workspace

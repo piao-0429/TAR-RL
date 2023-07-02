@@ -89,7 +89,6 @@ class MetersGroup(object):
                                               restval=0.0)
             if should_write_header:
                 self._csv_writer.writeheader()
-
         self._csv_writer.writerow(data)
         self._csv_file.flush()
 

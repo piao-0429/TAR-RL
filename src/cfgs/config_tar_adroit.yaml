@@ -14,11 +14,12 @@ debug: 0
 # it can take a lot more memory especially for relocate, and later ablation shows
 # frame_stack does not affect performance significantly in Adroit, so here we set it to 1.
 frame_stack: 1
-action_repeat: 2
+action_repeat: 1
 discount: 0.99
 # eval
 eval_every_frames: 50000
 num_eval_episodes: 25
+stage1_eval_every_frames: 50
 stage2_eval_every_frames: 5000
 stage2_num_eval_episodes: 5
 # snapshot
@@ -28,18 +29,25 @@ replay_buffer_size: 1000000
 replay_buffer_num_workers: 4
 nstep: 3
 batch_size: 256
+# trajectory buffer
+traj_buffer_size: 50
+seq_len: 200
+traj_batch_size: 8
+traj_buffer_num_workers: 2
 # misc
 seed: 1
 device: cuda
 save_video: false
 save_train_video: false
+use_wb: true
 use_tb: false
 save_models: false
-local_data_dir: '/home/puhua/TAR-RL/data'
+local_data_dir: '/home/hp/TAR-RL/data'
 show_computation_time_est: true # provide estimates on computation times
-show_time_est_interval: 2500
+show_time_est_interval: 50
 # experiment
-experiment: exp
+project: TAR-RL-adroit
+experiment: door-no_repeat_no_extra_loss
 # environment
 env_feature_type: 'pixels'
 use_sensor: true
@@ -49,8 +57,8 @@ lr: 1e-4
 feature_dim: 50
 
 # ====== stage 1 ======
-stage1_model_name: 'resnet6_32channel' # model name example: resnet6_32channel, resnet6_64channel, resnet10_32channel
-stage1_use_pretrain: true # if false then we start from scratch
+visual_model_name: 'r3m50' # model name example: resnet6_32channel, resnet6_64channel, resnet10_32channel
+stage1_n_update: 1000
 
 # ====== stage 2 ======
 load_demo: true
@@ -61,22 +69,26 @@ stage2_n_update: 30000
 num_seed_frames: 0
 
 agent:
-  _target_: vrl3_agent.VRL3Agent
+  _target_: tar_agent.TARAgent
   obs_shape: ??? # to be specified later
   action_shape: ??? # to be specified later
   device: ${device}
   critic_target_tau: 0.01
   update_every_steps: 2
-  use_tb: ${use_tb}
+  use_wb: ${use_wb}
   lr: 1e-4
   hidden_dim: 1024
   feature_dim: 50
+  act_rep_dim: 8
 
   # environment related
   use_sensor: ${use_sensor}
 
   # ====== stage 1 ======
-  stage1_model_name: ${stage1_model_name}
+  visual_model_name: ${visual_model_name}
+  seq_len: ${seq_len}
+  cls_weight: 0.0
+  aln_weight: 0.0
 
   # ====== stage 2, 3 ======
   use_data_aug: true
@@ -90,22 +102,22 @@ agent:
   pretanh_penalty: 0.001
 
   # ====== stage 2 ======
-  stage2_update_encoder: true # decides whether encoder is frozen or finetune in stage 2
+  stage2_update_encoder: false # decides whether encoder is frozen or finetune in stage 2
   cql_weight: 1
   cql_temp: 1
   cql_n_random: 10
   stage2_std: 0.1
-  stage2_bc_weight: 0 # ablation shows additional BC does not help performance
+  stage2_bc_weight: 0.1 # ablation shows additional BC does not help performance
 
   # ====== stage 3 ======
-  stage3_update_encoder: true
+  stage3_update_encoder: false
   num_expl_steps: 0 # number of random actions at start of stage 3
   # std decay
   std0: 0.01
   std1: 0.01
   std_n_decay: 500000
   # bc decay
-  stage3_bc_lam0: 0 # ablation shows additional BC does not help performance
+  stage3_bc_lam0: 0.01 # ablation shows additional BC does not help performance
   stage3_bc_lam1: 0.95
 
 hydra:

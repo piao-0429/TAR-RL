@@ -6,6 +6,7 @@ import os, psutil
 os.environ['LD_LIBRARY_PATH'] = os.environ.get('LD_LIBRARY_PATH', '') + \
                                 ':/home/hp/.mujoco/mujoco210/bin:/usr/local/nvidia/lib:/usr/lib/nvidia'
 os.environ['MUJOCO_PY_MUJOCO_PATH'] = '/home/hp/.mujoco/mujoco210/'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import numpy as np
 import shutil
 import warnings
@@ -37,7 +38,7 @@ import time
 torch.backends.cudnn.benchmark = True
 
 # TODO this part can be done during workspace setup
-ENV_TYPE = 'adroit'
+ENV_TYPE = 'dmc'
 if ENV_TYPE == 'adroit':
     import mj_envs
     from mjrl.utils.gym_env import GymEnv
@@ -123,11 +124,11 @@ class Workspace:
             assert self.cfg.action_repeat % 2 == 0
 
         # create logger
-        self.logger = Logger(self.work_dir, use_wb=self.cfg.use_wb)
+        self.logger = Logger(self.cfg.project, self.cfg.experiment+'-'+str(self.cfg.seed), self.work_dir, use_wb=self.cfg.use_wb, use_tb=self.cfg.use_tb)
         env_name = self.cfg.task_name
         env_type = 'adroit' if env_name in ('hammer-v0','door-v0','pen-v0','relocate-v0') else 'dmc'
         # assert env_name in ('hammer-v0','door-v0','pen-v0','relocate-v0',)
-
+        self.env_type = env_type
         if self.cfg.agent.encoder_lr_scale == 'auto':
             if env_name == 'relocate-v0':
                 self.cfg.agent.encoder_lr_scale = 0.01
@@ -226,6 +227,8 @@ class Workspace:
             log('episode_length', step * self.cfg.action_repeat / episode)
             log('episode', self.global_episode)
             log('step', self.global_step)
+            
+        return total_reward / episode, 0
 
     def eval_adroit(self, force_number_episodes=None, do_log=True):
         if ENV_TYPE != 'adroit':
@@ -293,61 +296,122 @@ class Workspace:
         return demo_path
 
     def load_demo(self, replay_storage, env_name, verbose=True):
-        # will load demo data and put them into a replay storage
-        demo_path = self.get_demo_path(env_name)
-        if verbose:
-            print("Trying to get demo data from:", demo_path)
+        if self.env_type == 'adroit':
+            # will load demo data and put them into a replay storage
+            demo_path = self.get_demo_path(env_name)
+            if verbose:
+                print("Trying to get demo data from:", demo_path)
 
-        # get the raw state demo data, a list of length 25
-        demo_data = pickle.load(open(demo_path, 'rb'))
-        if self.cfg.num_demo >= 0:
-            demo_data = demo_data[:self.cfg.num_demo]
+            # get the raw state demo data, a list of length 25
+            demo_data = pickle.load(open(demo_path, 'rb'))
+            if self.cfg.num_demo >= 0:
+                demo_data = demo_data[:self.cfg.num_demo]
+                
 
-        """
-        the adroit demo data is in raw state, so we need to convert them into image data
-        we init an env and run episodes with the stored actions in the demo data
-        then put the image and sensor data into the replay buffer, also need to clip actions here 
-        this part is basically following the RRL code
-        """
-        demo_env = AdroitEnv(env_name, test_image=False, num_repeats=1, num_frames=self.cfg.frame_stack,
-                env_feature_type=self.env_feature_type, device=self.device, reward_rescale=self.cfg.reward_rescale)
-        demo_env.reset()
-
-        total_data_count = 0
-        for i_path in range(len(demo_data)):
-            path = demo_data[i_path]
+            """
+            the adroit demo data is in raw state, so we need to convert them into image data
+            we init an env and run episodes with the stored actions in the demo data
+            then put the image and sensor data into the replay buffer, also need to clip actions here 
+            this part is basically following the RRL code
+            """
+        
+            demo_env = AdroitEnv(env_name, test_image=False, num_repeats=1, num_frames=self.cfg.frame_stack,
+                    env_feature_type=self.env_feature_type, device=self.device, reward_rescale=self.cfg.reward_rescale)
             demo_env.reset()
-            demo_env.set_env_state(path['init_state_dict'])
-            time_step = demo_env.get_current_obs_without_reset()
-            replay_storage.add(time_step)
 
-            ep_reward = 0
-            ep_n_goal = 0
-            for i_act in range(len(path['actions'])):
-                total_data_count += 1
-                action = path['actions'][i_act]
-                action = action.astype(np.float32)
-                # when action is put into the environment, they will be clipped.
-                action[action > 1] = 1
-                action[action < -1] = -1
-
-                # when they collect the demo data, they actually did not use a timelimit...
-                if i_act == len(path['actions']) - 1:
-                    force_step_type = 'last'
-                else:
-                    force_step_type = 'mid'
-
-                time_step = demo_env.step(action, force_step_type=force_step_type)
+            total_data_count = 0
+            for i_path in range(len(demo_data)):
+                path = demo_data[i_path]
+                demo_env.reset()
+                demo_env.set_env_state(path['init_state_dict'])
+                time_step = demo_env.get_current_obs_without_reset()
                 replay_storage.add(time_step)
 
-                reward = time_step.reward
-                ep_reward += reward
+                ep_reward = 0
+                ep_n_goal = 0
+                for i_act in range(len(path['actions'])):
+                    total_data_count += 1
+                    action = path['actions'][i_act]
+                    action = action.astype(np.float32)
+                    # when action is put into the environment, they will be clipped.
+                    action[action > 1] = 1
+                    action[action < -1] = -1
 
-                goal_achieved = time_step.n_goal_achieved
-                ep_n_goal += goal_achieved
-            if verbose:
-                print('demo trajectory %d, len: %d, return: %.2f, goal achieved steps: %d' %
-                      (i_path, len(path['actions']), ep_reward, ep_n_goal))
+                    # when they collect the demo data, they actually did not use a timelimit...
+                    if i_act == len(path['actions']) - 1:
+                        force_step_type = 'last'
+                    else:
+                        force_step_type = 'mid'
+
+                    time_step = demo_env.step(action, force_step_type=force_step_type)
+                    replay_storage.add(time_step)
+
+                    reward = time_step.reward
+                    ep_reward += reward
+
+                    goal_achieved = time_step.n_goal_achieved
+                    ep_n_goal += goal_achieved
+                if verbose:
+                    print('demo trajectory %d, len: %d, return: %.2f, goal achieved steps: %d' %
+                        (i_path, len(path['actions']), ep_reward, ep_n_goal))
+        else:
+            
+            total_data_count = 0
+            data_folder_path = self.get_data_folder_path()
+            pt_path = data_folder_path + '/ckpts/' + self.cfg.task_name + '/' + str(self.cfg.seed) + '/checkpoint-1000000.pt'
+            agent = torch.load(pt_path)
+            
+            for i_demo in range(self.cfg.num_demo):
+                demo_env = dmc.make(self.cfg.task_name, self.cfg.frame_stack,
+                                self.cfg.action_repeat, self.cfg.seed + i_demo)
+                action_shape = demo_env.action_spec().shape[0]
+                total_reward = 0
+                step = 0
+                actions = np.zeros((500, action_shape), dtype=np.float64)
+                time_step = demo_env.reset()
+                replay_storage.add(time_step)
+                while not time_step.last():
+                    with torch.no_grad(), utils.eval_mode(agent):
+                        # observations[step] = time_step.observation
+                        action = agent.act(time_step.observation,
+                                                5000,
+                                                eval_mode=True)
+                        actions[step] = action
+                    time_step = demo_env.step(action)
+                    replay_storage.add(time_step)
+                    total_reward += time_step.reward
+                    step += 1
+                    total_data_count += 1
+                if verbose:
+                    print('demo trajectory %d, len: %d, return: %.2f' %
+                        (i_demo, step, total_reward))
+            # for i_path in range(len(demo_data)):
+            #     path = demo_data[i_path]
+            #     demo_env.reset()
+            #     demo_env.physics.set_state(path['init_state_dict'])
+            #     demo_env.task.after_step(demo_env.physics)
+            #     time_step = dmc.get_current_obs_without_reset(demo_env)
+            #     replay_storage.add(time_step)
+
+            #     ep_reward = 0
+                
+            #     for i_act in range(len(path['actions'])):
+            #         total_data_count += 1
+            #         action = path['actions'][i_act]
+            #         action = action.astype(np.float32)
+            #         # when action is put into the environment, they will be clipped.
+            #         action[action > 1] = 1
+            #         action[action < -1] = -1
+            #         print(demo_env.physics.get_state())
+            #         time_step = demo_env.step(action)
+            #         replay_storage.add(time_step)
+            #         print(action)
+            #         print(demo_env.physics.get_state())
+            #         reward = time_step.reward
+            #         print(reward)
+            #         ep_reward += reward
+
+            
         if verbose:
             print("Demo data load finished, total data count:", total_data_count)
 
@@ -521,7 +585,7 @@ class Workspace:
         #     amlt_path_to = '/vrl3data/logs'
         #     copy_tree(str(container_log_path), amlt_path_to, update=1)
 
-@hydra.main(config_path='cfgs_adroit', config_name='config')
+@hydra.main(config_path='cfgs', config_name='config_vrl3_dmc')
 def main(cfg):
     # TODO potentially check the task name and decide which libs to load here? 
     W = Workspace

@@ -11,7 +11,7 @@ import numpy as np
 import shutil
 import warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
-os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
+os.environ['MKL_SERVICE_FORCE_INTEL'] = '0'
 import platform
 os.environ['MUJOCO_GL'] = 'egl'
 # set to glfw if trying to render locally with a monitor
@@ -39,7 +39,7 @@ import time
 torch.backends.cudnn.benchmark = True
 
 # TODO this part can be done during workspace setup
-ENV_TYPE = 'dmc'
+ENV_TYPE = 'adroit'
 if ENV_TYPE == 'adroit':
     import mj_envs
     from mjrl.utils.gym_env import GymEnv
@@ -177,6 +177,7 @@ class Workspace:
             traj_data_specs = (specs.BoundedArray(shape=(self.cfg.seq_len, self.train_env.act_dim), dtype='float32', name='action_seq', minimum=-1.0, maximum=1.0),
                                specs.Array((1,), np.float32, name='action_label'),
                       ) 
+            print(self.train_env.act_dim)
         else:
             self.train_env = dmc.make(self.cfg.task_name, self.cfg.frame_stack,
                                   self.cfg.action_repeat, self.cfg.seed)
@@ -473,8 +474,8 @@ class Workspace:
                 metrics = self.agent.update_representation(self.replay_iter, self.traj_iter, i_stage1, use_sensor=IS_ADROIT)
                 self.logger.log_metrics(metrics, i_stage1, ty='train')
                 if i_stage1 % self.cfg.stage1_eval_every_frames == 0:
-                    print('Stage 1 step %d, reconstruction loss: %.2f, classification loss: %.2f, alignment loss: %.2f' %
-                          (i_stage1, metrics['loss_rec'],  metrics['loss_cls'], metrics['loss_aln']))
+                    print('Stage 1 step %d, reconstruction loss: %.3f, classification loss: %.3f, alignment loss: %.3f, forward-inverse cycle consistency loss: %.3f' %
+                          (i_stage1, metrics['loss_rec'],  metrics['loss_cls'], metrics['loss_aln'], metrics['loss_ficc']))
                 if self.cfg.show_computation_time_est and i_stage1 > 0 and i_stage1 % self.cfg.show_time_est_interval == 0:
                     print_stage1_time_est(time.time()-stage1_start_time, i_stage1+1, stage1_n_update)
 

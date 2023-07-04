@@ -209,7 +209,25 @@ class LatentInvDynMLP(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, act_rep_dim)
         
-    def forward(self, x):
+    def forward(self, x1, x2):
+        x = torch.cat([x1, x2], dim=1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = torch.tanh(self.fc3(x))
+        return x
+    
+class LatentForDynMLP(nn.Module):
+    def __init__(self, ob_rep_dim, act_rep_dim, hidden_dim):
+        super(LatentForDynMLP, self).__init__()
+        self.ob_rep_dim = ob_rep_dim
+        self.act_rep_dim = act_rep_dim
+        self.hidden_dim = hidden_dim
+        self.fc1 = nn.Linear(ob_rep_dim + act_rep_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, ob_rep_dim)
+        
+    def forward(self, x1, x2):
+        x = torch.cat([x1, x2], dim=1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = torch.tanh(self.fc3(x))
@@ -326,7 +344,7 @@ class LatentCritic(nn.Module):
 
 class TARAgent:
     def __init__(self, obs_shape, action_shape, act_rep_dim, seq_len, device, use_sensor, lr, feature_dim, hidden_dim, policy_output_type,
-                 cls_weight, aln_weight, critic_target_tau, num_expl_steps,
+                 cls_weight, aln_weight, ficc_weight, critic_target_tau, num_expl_steps,
                  update_every_steps, stddev_clip, use_wb, use_data_aug, encoder_lr_scale,
                  visual_model_name, safe_q_target_factor, safe_q_threshold, pretanh_penalty, pretanh_threshold,
                  stage2_update_encoder, stage2_update_autoencoder, cql_weight, cql_temp, cql_n_random, stage2_std, stage2_bc_weight,
@@ -414,6 +432,7 @@ class TARAgent:
         self.action_ae = ActionAE(action_shape[0], act_rep_dim, hidden_dim).to(device)
         self.task_cls = TaskDiscriminator(act_rep_dim, seq_len, hidden_dim).to(device)
         self.inv_dyn = LatentInvDynMLP(ob_rep_dim, act_rep_dim, hidden_dim).to(device)
+        self.for_dyn = LatentForDynMLP(ob_rep_dim, act_rep_dim, hidden_dim).to(device)
         
         self.act_dim = action_shape[0]
         self.act_rep_dim = act_rep_dim
@@ -433,6 +452,8 @@ class TARAgent:
 
         self.cls_weight = cls_weight
         self.aln_weight = aln_weight
+        self.ficc_weight = ficc_weight
+        
         # optimizers
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
@@ -441,6 +462,7 @@ class TARAgent:
         self.action_ae_ft_opt = torch.optim.Adam(self.action_ae.parameters(), lr=lr*0.1)
         self.task_cls_opt = torch.optim.Adam(self.task_cls.parameters(), lr=lr)
         self.inv_dyn_opt = torch.optim.Adam(self.inv_dyn.parameters(), lr=lr)
+        self.ficc_opt = torch.optim.Adam((para for para in list(self.inv_dyn.parameters()) + list(self.for_dyn.parameters())), lr=lr)
 
         encoder_lr = lr * encoder_lr_scale
         """ set up encoder optimizer """
@@ -563,8 +585,8 @@ class TARAgent:
         loss_rec = F.mse_loss(act_rec, action)
 
         if self.aln_weight > 0:
-            act_rep_forward = self.inv_dyn(torch.cat([ob_rep, ob_rep_next], dim=1))
-            loss_aln = F.mse_loss(act_rep_forward, act_rep) * self.aln_weight
+            act_rep_rec = self.inv_dyn(ob_rep, ob_rep_next)
+            loss_aln = F.mse_loss(act_rep_rec, act_rep) * self.aln_weight
         else:
             loss_aln = 0
         
@@ -572,27 +594,46 @@ class TARAgent:
             batch_traj = next(traj_iter)
             batch_seq, batch_label = utils.to_torch(batch_traj, self.device)
             with torch.no_grad():
-                batch_seq_rep, _, _ = self.action_ae.encode(batch_seq.reshape(-1, batch_seq.shape[-1]))
+                batch_seq_rep = self.action_ae.encode(batch_seq.reshape(-1, batch_seq.shape[-1]))[0]
                 batch_seq_rep = batch_seq_rep.reshape(batch_seq.shape[0],self.seq_len, self.act_rep_dim)
             logits = self.task_cls(batch_seq_rep)
             loss_cls = F.binary_cross_entropy_with_logits(logits, batch_label) * self.cls_weight
         else:
             loss_cls = 0
+            
+        if self.ficc_weight > 0:
+            # act_rep_rec = self.inv_dyn(ob_rep, ob_rep_next)
+            # ob_rep_next_rec = self.for_dyn(ob_rep, act_rep_rec)
+            # loss_ficc = F.mse_loss(ob_rep_next_rec, ob_rep_next) * self.ficc_weight
+            ob_rep_next_rec = self.for_dyn(ob_rep, act_rep)
+            act_rep_rec = self.inv_dyn(ob_rep, ob_rep_next_rec)
+            loss_ficc = F.mse_loss(act_rep_rec, act_rep) * self.ficc_weight
+        else:
+            loss_ficc = 0
         
-        loss = loss_rec + loss_cls + loss_aln
+        loss = loss_rec + loss_cls + loss_aln + loss_ficc
         
         metrics['loss_rec'] = loss_rec.item()
         metrics['loss_cls'] = loss_cls.item() if self.cls_weight > 0 else 0
         metrics['loss_aln'] = loss_aln.item() if self.aln_weight > 0 else 0
+        metrics['loss_ficc'] = loss_ficc.item() if self.ficc_weight > 0 else 0
         
         self.action_ae_opt.zero_grad()
-        self.task_cls_opt.zero_grad()
-        self.inv_dyn_opt.zero_grad()
+        if self.cls_weight > 0:
+            self.task_cls_opt.zero_grad()
+        if self.aln_weight > 0:
+            self.inv_dyn_opt.zero_grad()
+        if self.ficc_weight > 0:
+            self.ficc_opt.zero_grad()
+            
         loss.backward()
         self.action_ae_opt.step()
-        self.task_cls_opt.step()
-        self.inv_dyn_opt.step()
-        
+        if self.cls_weight > 0:
+            self.task_cls_opt.step()
+        if self.aln_weight > 0:
+            self.inv_dyn_opt.step()
+        if self.ficc_weight > 0:
+            self.ficc_opt.step()
         return metrics
 
     def update(self, replay_iter, step, stage, use_sensor):

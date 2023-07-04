@@ -47,7 +47,7 @@ show_computation_time_est: true # provide estimates on computation times
 show_time_est_interval: 50
 # experiment
 project: TAR-RL-adroit
-experiment: door-no_repeat_no_extra_loss
+experiment: door_action_vrl3_ficc_28
 # environment
 env_feature_type: 'pixels'
 use_sensor: true
@@ -57,8 +57,8 @@ lr: 1e-4
 feature_dim: 50
 
 # ====== stage 1 ======
-visual_model_name: 'r3m50' # model name example: resnet6_32channel, resnet6_64channel, resnet10_32channel
-stage1_n_update: 1000
+visual_model_name: 'vrl3' # model name example: resnet6_32channel, resnet6_64channel, resnet10_32channel
+stage1_n_update: 5000
 
 # ====== stage 2 ======
 load_demo: true
@@ -79,7 +79,9 @@ agent:
   lr: 1e-4
   hidden_dim: 1024
   feature_dim: 50
-  act_rep_dim: 8
+  act_rep_dim: 28
+  policy_output_type: 'action'
+  data_dir: ${local_data_dir}
 
   # environment related
   use_sensor: ${use_sensor}
@@ -89,6 +91,7 @@ agent:
   seq_len: ${seq_len}
   cls_weight: 0.0
   aln_weight: 0.0
+  ficc_weight: 1.0
 
   # ====== stage 2, 3 ======
   use_data_aug: true
@@ -102,7 +105,8 @@ agent:
   pretanh_penalty: 0.001
 
   # ====== stage 2 ======
-  stage2_update_encoder: false # decides whether encoder is frozen or finetune in stage 2
+  stage2_update_encoder: true # decides whether encoder is frozen or finetune in stage 2
+  stage2_update_autoencoder: true
   cql_weight: 1
   cql_temp: 1
   cql_n_random: 10
@@ -110,7 +114,8 @@ agent:
   stage2_bc_weight: 0.1 # ablation shows additional BC does not help performance
 
   # ====== stage 3 ======
-  stage3_update_encoder: false
+  stage3_update_encoder: true
+  stage3_update_autoencoder: true
   num_expl_steps: 0 # number of random actions at start of stage 3
   # std decay
   std0: 0.01

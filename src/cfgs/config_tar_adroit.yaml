@@ -44,10 +44,10 @@ use_tb: false
 save_models: false
 local_data_dir: '/home/hp/TAR-RL/data'
 show_computation_time_est: true # provide estimates on computation times
-show_time_est_interval: 50
+show_time_est_interval: 1000
 # experiment
 project: TAR-RL-adroit
-experiment: door_action_vrl3_ficc_28
+experiment: door_action_vrl3_ficcv2_28
 # environment
 env_feature_type: 'pixels'
 use_sensor: true

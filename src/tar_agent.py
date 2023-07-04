@@ -605,9 +605,11 @@ class TARAgent:
             # act_rep_rec = self.inv_dyn(ob_rep, ob_rep_next)
             # ob_rep_next_rec = self.for_dyn(ob_rep, act_rep_rec)
             # loss_ficc = F.mse_loss(ob_rep_next_rec, ob_rep_next) * self.ficc_weight
-            ob_rep_next_rec = self.for_dyn(ob_rep, act_rep)
-            act_rep_rec = self.inv_dyn(ob_rep, ob_rep_next_rec)
-            loss_ficc = F.mse_loss(act_rep_rec, act_rep) * self.ficc_weight
+            ob_rep_next_rec = self.for_dyn(ob_rep, act_rep.detach())
+            act_rep_rec = self.inv_dyn(ob_rep, self.for_dyn(ob_rep, act_rep))
+            loss_act_rec = F.mse_loss(act_rep_rec, act_rep)
+            loss_ob_rep_next_rec = F.mse_loss(ob_rep_next_rec, ob_rep_next)
+            loss_ficc = (loss_act_rec + loss_ob_rep_next_rec) * self.ficc_weight
         else:
             loss_ficc = 0
         

@@ -618,6 +618,8 @@ class TARAgent:
         metrics['loss_rec'] = loss_rec.item()
         metrics['loss_cls'] = loss_cls.item() if self.cls_weight > 0 else 0
         metrics['loss_aln'] = loss_aln.item() if self.aln_weight > 0 else 0
+        metrics['loss_ficc_act'] = loss_act_rec.item() * self.ficc_weight if self.ficc_weight > 0 else 0
+        metrics['loss_ficc_ob'] = loss_ob_rep_next_rec.item() * self.ficc_weight if self.ficc_weight > 0 else 0
         metrics['loss_ficc'] = loss_ficc.item() if self.ficc_weight > 0 else 0
         
         self.action_ae_opt.zero_grad()

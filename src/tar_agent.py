@@ -344,7 +344,7 @@ class LatentCritic(nn.Module):
 
 class TARAgent:
     def __init__(self, obs_shape, action_shape, act_rep_dim, seq_len, device, use_sensor, lr, feature_dim, hidden_dim, policy_output_type,
-                 cls_weight, aln_weight, ficc_weight, critic_target_tau, num_expl_steps,
+                 cls_weight, inv_weight, fwd_weight, ficc_weight, critic_target_tau, num_expl_steps,
                  update_every_steps, stddev_clip, use_wb, use_data_aug, encoder_lr_scale,
                  visual_model_name, safe_q_target_factor, safe_q_threshold, pretanh_penalty, pretanh_threshold,
                  stage2_update_encoder, stage2_update_autoencoder, cql_weight, cql_temp, cql_n_random, stage2_std, stage2_bc_weight,
@@ -432,7 +432,7 @@ class TARAgent:
         self.action_ae = ActionAE(action_shape[0], act_rep_dim, hidden_dim).to(device)
         self.task_cls = TaskDiscriminator(act_rep_dim, seq_len, hidden_dim).to(device)
         self.inv_dyn = LatentInvDynMLP(ob_rep_dim, act_rep_dim, hidden_dim).to(device)
-        self.for_dyn = LatentForDynMLP(ob_rep_dim, act_rep_dim, hidden_dim).to(device)
+        self.fwd_dyn = LatentForDynMLP(ob_rep_dim, act_rep_dim, hidden_dim).to(device)
         
         self.act_dim = action_shape[0]
         self.act_rep_dim = act_rep_dim
@@ -451,7 +451,8 @@ class TARAgent:
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         self.cls_weight = cls_weight
-        self.aln_weight = aln_weight
+        self.inv_weight = inv_weight
+        self.fwd_weight = fwd_weight
         self.ficc_weight = ficc_weight
         
         # optimizers
@@ -462,7 +463,8 @@ class TARAgent:
         self.action_ae_ft_opt = torch.optim.Adam(self.action_ae.parameters(), lr=lr*0.1)
         self.task_cls_opt = torch.optim.Adam(self.task_cls.parameters(), lr=lr)
         self.inv_dyn_opt = torch.optim.Adam(self.inv_dyn.parameters(), lr=lr)
-        self.ficc_opt = torch.optim.Adam((para for para in list(self.inv_dyn.parameters()) + list(self.for_dyn.parameters())), lr=lr)
+        self.fwd_dyn_opt = torch.optim.Adam(self.fwd_dyn.parameters(), lr=lr)
+        self.ficc_opt = torch.optim.Adam((para for para in list(self.inv_dyn.parameters()) + list(self.fwd_dyn.parameters())), lr=lr)
 
         encoder_lr = lr * encoder_lr_scale
         """ set up encoder optimizer """
@@ -584,12 +586,16 @@ class TARAgent:
         
         loss_rec = F.mse_loss(act_rec, action)
 
-        if self.aln_weight > 0:
+        if self.inv_weight > 0:
             act_rep_rec = self.inv_dyn(ob_rep, ob_rep_next)
-            loss_aln = F.mse_loss(act_rep_rec, act_rep) * self.aln_weight
+            loss_inv = (F.mse_loss(act_rep_rec.detach(), act_rep) + F.mse_loss(act_rep_rec, act_rep.detach())) * self.inv_weight
         else:
-            loss_aln = 0
+            loss_inv = 0
         
+        if self.fwd_weight > 0:
+            ob_rep_pred = self.fwd_dyn(ob_rep, action)
+            loss_fwd = F.mse_loss(ob_rep_pred, ob_rep_next) * self.fwd_weight
+            
         if self.cls_weight > 0:
             batch_traj = next(traj_iter)
             batch_seq, batch_label = utils.to_torch(batch_traj, self.device)
@@ -603,21 +609,21 @@ class TARAgent:
             
         if self.ficc_weight > 0:
             # act_rep_rec = self.inv_dyn(ob_rep, ob_rep_next)
-            # ob_rep_next_rec = self.for_dyn(ob_rep, act_rep_rec)
+            # ob_rep_next_rec = self.fwd_dyn(ob_rep, act_rep_rec)
             # loss_ficc = F.mse_loss(ob_rep_next_rec, ob_rep_next) * self.ficc_weight
-            ob_rep_next_rec = self.for_dyn(ob_rep, act_rep.detach())
-            act_rep_rec = self.inv_dyn(ob_rep, self.for_dyn(ob_rep, act_rep))
+            ob_rep_next_rec = self.fwd_dyn(ob_rep, act_rep.detach())
+            act_rep_rec = self.inv_dyn(ob_rep, self.fwd_dyn(ob_rep, act_rep))
             loss_act_rec = F.mse_loss(act_rep_rec, act_rep)
             loss_ob_rep_next_rec = F.mse_loss(ob_rep_next_rec, ob_rep_next)
             loss_ficc = (loss_act_rec + loss_ob_rep_next_rec) * self.ficc_weight
         else:
             loss_ficc = 0
         
-        loss = loss_rec + loss_cls + loss_aln + loss_ficc
+        loss = loss_rec + loss_cls + loss_inv + loss_fwd + loss_ficc
         
         metrics['loss_rec'] = loss_rec.item()
         metrics['loss_cls'] = loss_cls.item() if self.cls_weight > 0 else 0
-        metrics['loss_aln'] = loss_aln.item() if self.aln_weight > 0 else 0
+        metrics['loss_inv'] = loss_inv.item() if self.inv_weight > 0 else 0
         metrics['loss_ficc_act'] = loss_act_rec.item() * self.ficc_weight if self.ficc_weight > 0 else 0
         metrics['loss_ficc_ob'] = loss_ob_rep_next_rec.item() * self.ficc_weight if self.ficc_weight > 0 else 0
         metrics['loss_ficc'] = loss_ficc.item() if self.ficc_weight > 0 else 0
@@ -625,8 +631,10 @@ class TARAgent:
         self.action_ae_opt.zero_grad()
         if self.cls_weight > 0:
             self.task_cls_opt.zero_grad()
-        if self.aln_weight > 0:
+        if self.inv_weight > 0:
             self.inv_dyn_opt.zero_grad()
+        if self.fwd_weight > 0:
+            self.fwd_dyn_opt.zero_grad()
         if self.ficc_weight > 0:
             self.ficc_opt.zero_grad()
             
@@ -634,7 +642,7 @@ class TARAgent:
         self.action_ae_opt.step()
         if self.cls_weight > 0:
             self.task_cls_opt.step()
-        if self.aln_weight > 0:
+        if self.inv_weight > 0:
             self.inv_dyn_opt.step()
         if self.ficc_weight > 0:
             self.ficc_opt.step()

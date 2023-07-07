@@ -90,7 +90,8 @@ agent:
   visual_model_name: ${visual_model_name}
   seq_len: ${seq_len}
   cls_weight: 0.0
-  aln_weight: 0.0
+  inv_weight: 0.0
+  fwd_weight: 0.0
   ficc_weight: 1.0
 
   # ====== stage 2, 3 ======

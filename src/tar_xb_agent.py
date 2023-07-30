@@ -156,54 +156,13 @@ class TaskDiscriminator(nn.Module):
         return logits
     
 
-class StochasticActionAE(nn.Module):
+class ActionAE(nn.Module):
     def __init__(self, action_dim, act_rep_dim, hidden_dim):
-        super(StochasticActionAE, self).__init__()
+        super(ActionAE, self).__init__()
         self.action_dim = action_dim
         self.latent_dim = act_rep_dim
         self.hidden_dim = hidden_dim
-        self.fc1 = nn.Linear(action_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.enc_mu = nn.Linear(hidden_dim, act_rep_dim)
-        self.enc_log_sigma = torch.nn.Linear(hidden_dim, act_rep_dim)
         
-        self.fc3 = nn.Linear(act_rep_dim, hidden_dim)
-        self.fc4 = nn.Linear(hidden_dim, hidden_dim)
-        self.dec_mu = nn.Linear(hidden_dim, action_dim)
-        self.dec_log_sigma = nn.Linear(hidden_dim, action_dim)
-        
-    def reparamize(self, mu, log_sigma):
-        std = torch.exp(log_sigma)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-        
-    def encode(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        mu = self.enc_mu(x)
-        log_sigma = self.enc_log_sigma(x)
-        z = self.reparamize(mu, log_sigma)
-        return z, mu, log_sigma
-    
-    def decode(self, z):
-        x = F.relu(self.fc3(z))
-        x = F.relu(self.fc4(x))
-        mu = self.dec_mu(x)
-        log_sigma = self.dec_log_sigma(x)
-        x = self.reparamize(mu, log_sigma)
-        return x, mu, log_sigma
-    
-    def forward(self, x):
-        z, enc_mu, enc_log_sigma = self.encode(x)
-        x_rec, dec_mu, dec_log_sigma = self.decode(z)
-        return x_rec, x, enc_mu, enc_log_sigma
-
-class DeterministicActionAE(nn.Module):
-    def __init__(self, action_dim, act_rep_dim, hidden_dim):
-        super(DeterministicActionAE, self).__init__()
-        self.action_dim = action_dim
-        self.latent_dim = act_rep_dim
-        self.hidden_dim = hidden_dim
         self.fc1 = nn.Linear(action_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.enc = nn.Linear(hidden_dim, act_rep_dim)
@@ -228,7 +187,44 @@ class DeterministicActionAE(nn.Module):
         z = self.encode(x)
         x_rec = self.decode(z)
         return x_rec
+
+class ConditionalActionAE(nn.Module):
+    def __init__(self, ob_rep_dim, feature_dim, action_dim, act_rep_dim, hidden_dim):
+        super(ActionAE, self).__init__()
+        self.action_dim = action_dim
+        self.latent_dim = act_rep_dim
+        self.hidden_dim = hidden_dim
+        self.feature_dim = feature_dim
+        
+        self.trunk = nn.Sequential(nn.Linear(ob_rep_dim, feature_dim),
+                                   nn.LayerNorm(feature_dim), nn.Tanh())
+        
+        self.fc1 = nn.Linear(action_dim+feature_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.enc = nn.Linear(hidden_dim, act_rep_dim)
+        
+        self.fc3 = nn.Linear(act_rep_dim+feature_dim, hidden_dim)
+        self.fc4 = nn.Linear(hidden_dim, hidden_dim)
+        self.dec = nn.Linear(hidden_dim, action_dim)
+        
+    def encode(self, x, h):
+        h = self.trunk(h)
+        z = F.relu(self.fc1(torch.cat([x, h], dim=1)))
+        z = F.relu(self.fc2(z))
+        z = self.enc(z)
+        return z
     
+    def decode(self, z, h):
+        h = self.trunk(h)
+        x = F.relu(self.fc3(torch.cat([z, h], dim=1)))
+        x = F.relu(self.fc4(x))
+        x = self.dec(x)
+        return x
+    
+    def forward(self, x, h):
+        z = self.encode(x, h)
+        x_rec = self.decode(z, h)
+        return x_rec
     
 class LatentInvDynMLP(nn.Module):
     def __init__(self, ob_rep_dim, act_rep_dim, hidden_dim):
@@ -319,6 +315,7 @@ class LatentActor(nn.Module):
 
         self.action_shift=0
         self.action_scale=1
+        self.ob_rep_dim = ob_rep_dim
         self.apply(utils.weight_init)
 
     def forward(self, obs, std):
@@ -373,8 +370,8 @@ class LatentCritic(nn.Module):
 
         return q1, q2
 
-class TARAgent:
-    def __init__(self, obs_shape, action_shape, act_rep_dim, seq_len, device, use_sensor, lr, feature_dim, hidden_dim, policy_output_type,
+class CrossEmbodimentTARAgent:
+    def __init__(self, obs_shape, action_shape, act_rep_dim, seq_len, device, use_sensor, lr, feature_dim, hidden_dim, policy_output_type, ae_type,
                  cls_weight, inv_weight, fwd_weight, ficc_weight, critic_target_tau, num_expl_steps,
                  update_every_steps, stddev_clip, use_wb, use_data_aug, encoder_lr_scale,
                  visual_model_name, safe_q_target_factor, safe_q_threshold, pretanh_penalty, pretanh_threshold,
@@ -388,6 +385,7 @@ class TARAgent:
         self.action_shape = action_shape
         self.device = device
         self.policy_output_type = policy_output_type
+        self.ae_type = ae_type
         self.critic_target_tau = critic_target_tau
         self.update_every_steps = update_every_steps
         self.use_wb = use_wb
@@ -459,11 +457,15 @@ class TARAgent:
             ob_rep_dim = ob_rep_dim + 24
             
         self.ob_rep_dim = ob_rep_dim
-            
-        self.action_ae = StochasticActionAE(action_shape[0], act_rep_dim, hidden_dim).to(device)
-        self.task_cls = TaskDiscriminator(act_rep_dim, seq_len, hidden_dim).to(device)
+        if self.ae_type == 'conditional':
+            self.action_ae_1 = ConditionalActionAE(feature_dim, action_shape[0], act_rep_dim, hidden_dim).to(device) 
+            self.action_ae_2 = ConditionalActionAE(feature_dim, action_shape[0], act_rep_dim, hidden_dim).to(device)  
+        else:
+            self.action_ae_1 = ActionAE(action_shape[0], act_rep_dim, hidden_dim).to(device)
+            self.action_ae_2 = ActionAE(action_shape[0], act_rep_dim, hidden_dim).to(device)
+        # self.task_cls = TaskDiscriminator(act_rep_dim, seq_len, hidden_dim).to(device)
         self.inv_dyn = LatentInvDynMLP(ob_rep_dim, act_rep_dim, hidden_dim).to(device)
-        self.fwd_dyn = LatentForDynMLP(ob_rep_dim, act_rep_dim, hidden_dim).to(device)
+        # self.fwd_dyn = LatentForDynMLP(ob_rep_dim, act_rep_dim, hidden_dim).to(device)
         
         self.act_dim = action_shape[0]
         self.act_rep_dim = act_rep_dim
@@ -481,21 +483,21 @@ class TARAgent:
                                     feature_dim, hidden_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        self.cls_weight = cls_weight
+        # self.cls_weight = cls_weight
         self.inv_weight = inv_weight
-        self.fwd_weight = fwd_weight
-        self.ficc_weight = ficc_weight
+        # self.fwd_weight = fwd_weight
+        # self.ficc_weight = ficc_weight
         
         # optimizers
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
         
-        self.action_ae_opt = torch.optim.Adam(self.action_ae.parameters(), lr=lr)
-        self.action_ae_ft_opt = torch.optim.Adam(self.action_ae.parameters(), lr=lr*0.1)
-        self.task_cls_opt = torch.optim.Adam(self.task_cls.parameters(), lr=lr)
+        self.action_ae_1_opt = torch.optim.Adam(self.action_ae_1.parameters(), lr=lr)
+        self.action_ae_2_opt = torch.optim.Adam(self.action_ae_2.parameters(), lr=lr)
+        # self.task_cls_opt = torch.optim.Adam(self.task_cls.parameters(), lr=lr)
         self.inv_dyn_opt = torch.optim.Adam(self.inv_dyn.parameters(), lr=lr)
-        self.fwd_dyn_opt = torch.optim.Adam(self.fwd_dyn.parameters(), lr=lr)
-        self.ficc_opt = torch.optim.Adam((para for para in list(self.inv_dyn.parameters()) + list(self.fwd_dyn.parameters())), lr=lr)
+        # self.fwd_dyn_opt = torch.optim.Adam(self.fwd_dyn.parameters(), lr=lr)
+        # self.ficc_opt = torch.optim.Adam((para for para in list(self.inv_dyn.parameters()) + list(self.fwd_dyn.parameters())), lr=lr)
 
         encoder_lr = lr * encoder_lr_scale
         """ set up encoder optimizer """
@@ -548,7 +550,7 @@ class TARAgent:
         self.actor.train(training)
         self.critic.train(training)
 
-    def act(self, obs, step, eval_mode, obs_sensor=None, is_tensor_input=False, force_action_std=None):
+    def act(self, obs, step, eval_mode, obs_sensor=None, is_tensor_input=False, force_action_std=None, reverse_action=False):
         # eval_mode should be False when taking an exploration action in stage 3
         # eval_mode should be True when evaluate agent performance
         if force_action_std == None:
@@ -581,7 +583,10 @@ class TARAgent:
                 act_rep.uniform_(-1.0, 1.0)
         
         if self.policy_output_type == 'latent':
-            action = self.action_ae.decode(act_rep)[0]
+            if reverse_action:
+                action = self.action_ae_2.decode(act_rep)
+            else:
+                action = self.action_ae_1.decode(act_rep)
             action = torch.clamp(action, -1.0, 1.0)
         else:
             action = act_rep
@@ -592,98 +597,133 @@ class TARAgent:
         
         metrics = dict()
         
-        batch = next(replay_iter)
+        batch_1 = next(replay_iter[0])
+        batch_2 = next(replay_iter[1])
        
         if use_sensor: # TODO might want to...?
-            obs, action, reward, discount, next_obs, obs_sensor, obs_sensor_next = utils.to_torch(batch, self.device)
+            obs_1, action_1, reward_1, discount_1, next_obs_1, obs_sensor_1, obs_sensor_next_1 = utils.to_torch(batch_1, self.device)
+            obs_2, action_2, reward_2, discount_2, next_obs_2, obs_sensor_2, obs_sensor_next_2 = utils.to_torch(batch_2, self.device)
         else:
-            obs, action, reward, discount, next_obs = utils.to_torch(batch, self.device)
+            obs_1, action_1, reward_1, discount_1, next_obs_1 = utils.to_torch(batch_1, self.device)
+            obs_2, action_2, reward_2, discount_2, next_obs_2 = utils.to_torch(batch_2, self.device)
             
         # augment
         if self.use_data_aug:
-            obs = self.aug(obs.float())
-            next_obs = self.aug(next_obs.float())
+            obs_1 = self.aug(obs_1.float())
+            next_obs_1 = self.aug(next_obs_1.float())
+            obs_2 = self.aug(obs_2.float())
+            next_obs_2 = self.aug(next_obs_2.float())
         
         with torch.no_grad():  
-            ob_rep = self.encoder(obs)
-            ob_rep_next = self.encoder(next_obs)
+            ob_rep_1 = self.encoder(obs_1)
+            ob_rep_2 = self.encoder(obs_2)
+            ob_rep_next_1 = self.encoder(next_obs_1)
+            ob_rep_next_2 = self.encoder(next_obs_2)
         
         if use_sensor:
-            ob_rep = torch.cat([ob_rep, obs_sensor], dim=1)
-            ob_rep_next = torch.cat([ob_rep_next, obs_sensor_next], dim=1)
-
-        act_rep = self.action_ae.encode(action)[0]
-        act_rec= self.action_ae.forward(action)[0]
+            ob_rep_1 = torch.cat([ob_rep_1, obs_sensor_1], dim=1)
+            ob_rep_next_1 = torch.cat([ob_rep_next_1, obs_sensor_next_1], dim=1)
+            ob_rep_2 = torch.cat([ob_rep_2, obs_sensor_2], dim=1)
+            ob_rep_next_2 = torch.cat([ob_rep_next_2, obs_sensor_next_2], dim=1)
+            
+        if self.ae_type == 'conditional':
+            act_rep_1 = self.action_ae_1.encode(action_1, ob_rep_1)
+            act_rec_1= self.action_ae_1.forward(action_1, ob_rep_1)
+            act_rep_2 = self.action_ae_2.encode(action_2, ob_rep_2)
+            act_rec_2= self.action_ae_2.forward(action_2, ob_rep_2)
+            act_cycle_rec_1 = self.action_ae_1.decode(self.action_ae_2.encode(self.action_ae_2.decode(act_rep_1, ob_rep_1), ob_rep_1), ob_rep_1)
+            act_cycle_rec_2 = self.action_ae_2.decode(self.action_ae_1.encode(self.action_ae_1.decode(act_rep_2, ob_rep_2), ob_rep_2), ob_rep_2)
+        else:
+            act_rep_1 = self.action_ae_1.encode(action_1)
+            act_rec_1= self.action_ae_1.forward(action_1)
+            act_rep_2 = self.action_ae_2.encode(action_2)
+            act_rec_2= self.action_ae_2.forward(action_2)
+            act_cycle_rec_1 = self.action_ae_1.decode(self.action_ae_2.encode(self.action_ae_2.decode(act_rep_1)))
+            act_cycle_rec_2 = self.action_ae_2.decode(self.action_ae_1.encode(self.action_ae_1.decode(act_rep_2)))
         
-        loss_rec = F.mse_loss(act_rec, action)
+        loss_rec = F.mse_loss(act_rec_1, action_1) + F.mse_loss(act_rec_2, action_2)
 
+        loss_cycle_rec =  F.mse_loss(act_cycle_rec_1, action_1) + F.mse_loss(act_cycle_rec_2, action_2)
+        
+        
         if self.inv_weight > 0:
-            act_rep_rec = self.inv_dyn(ob_rep, ob_rep_next)
-            loss_inv = (F.mse_loss(act_rep_rec.detach(), act_rep) + F.mse_loss(act_rep_rec, act_rep.detach())) * self.inv_weight
+            act_rep_rec_1 = self.inv_dyn(ob_rep_1, ob_rep_next_1)
+            act_rep_rec_2 = self.inv_dyn(ob_rep_2, ob_rep_next_2)
+            loss_inv_1 = (F.mse_loss(act_rep_rec_1.detach(), act_rep_1) + F.mse_loss(act_rep_rec_1, act_rep_1.detach())) * self.inv_weight
+            loss_inv_2 = (F.mse_loss(act_rep_rec_2.detach(), act_rep_2) + F.mse_loss(act_rep_rec_2, act_rep_2.detach())) * self.inv_weight
+            loss_inv = (loss_inv_1 + loss_inv_2)/2
         else:
             loss_inv = 0
         
-        if self.fwd_weight > 0:
-            ob_rep_pred = self.fwd_dyn(ob_rep, action)
-            loss_fwd = F.mse_loss(ob_rep_pred, ob_rep_next) * self.fwd_weight
+        # if self.fwd_weight > 0:
+        #     ob_rep_pred = self.fwd_dyn(ob_rep, action)
+        #     loss_fwd = F.mse_loss(ob_rep_pred, ob_rep_next) * self.fwd_weight
             
-        if self.cls_weight > 0:
-            batch_traj = next(traj_iter)
-            batch_seq, batch_label = utils.to_torch(batch_traj, self.device)
-            with torch.no_grad():
-                batch_seq_rep = self.action_ae.encode(batch_seq.reshape(-1, batch_seq.shape[-1]))[0]
-                batch_seq_rep = batch_seq_rep.reshape(batch_seq.shape[0],self.seq_len, self.act_rep_dim)
-            logits = self.task_cls(batch_seq_rep)
-            loss_cls = F.binary_cross_entropy_with_logits(logits, batch_label) * self.cls_weight
-        else:
-            loss_cls = 0
+        # if self.cls_weight > 0:
+        #     batch_traj = next(traj_iter)
+        #     batch_seq, batch_label = utils.to_torch(batch_traj, self.device)
+        #     with torch.no_grad():
+        #         batch_seq_rep = self.action_ae.encode(batch_seq.reshape(-1, batch_seq.shape[-1]))[0]
+        #         batch_seq_rep = batch_seq_rep.reshape(batch_seq.shape[0],self.seq_len, self.act_rep_dim)
+        #     logits = self.task_cls(batch_seq_rep)
+        #     loss_cls = F.binary_cross_entropy_with_logits(logits, batch_label) * self.cls_weight
+        # else:
+        #     loss_cls = 0
             
-        if self.ficc_weight > 0:
-            # act_rep_rec = self.inv_dyn(ob_rep, ob_rep_next)
-            # ob_rep_next_rec = self.fwd_dyn(ob_rep, act_rep_rec)
-            # loss_ficc = F.mse_loss(ob_rep_next_rec, ob_rep_next) * self.ficc_weight
-            ob_rep_next_rec = self.fwd_dyn(ob_rep, act_rep.detach())
-            act_rep_rec = self.inv_dyn(ob_rep, self.fwd_dyn(ob_rep, act_rep))
-            loss_act_rec = F.mse_loss(act_rep_rec, act_rep)
-            loss_ob_rep_next_rec = F.mse_loss(ob_rep_next_rec, ob_rep_next)
-            loss_ficc = (loss_act_rec + loss_ob_rep_next_rec) * self.ficc_weight
-        else:
-            loss_ficc = 0
+        # if self.ficc_weight > 0:
+        #     # act_rep_rec = self.inv_dyn(ob_rep, ob_rep_next)
+        #     # ob_rep_next_rec = self.fwd_dyn(ob_rep, act_rep_rec)
+        #     # loss_ficc = F.mse_loss(ob_rep_next_rec, ob_rep_next) * self.ficc_weight
+        #     ob_rep_next_rec = self.fwd_dyn(ob_rep, act_rep.detach())
+        #     act_rep_rec = self.inv_dyn(ob_rep, self.fwd_dyn(ob_rep, act_rep))
+        #     loss_act_rec = F.mse_loss(act_rep_rec, act_rep)
+        #     loss_ob_rep_next_rec = F.mse_loss(ob_rep_next_rec, ob_rep_next)
+        #     loss_ficc = (loss_act_rec + loss_ob_rep_next_rec) * self.ficc_weight
+        # else:
+        #     loss_ficc = 0
         
-        loss = loss_rec + loss_cls + loss_inv + loss_fwd + loss_ficc
+        # loss = loss_rec + loss_cls + loss_inv + loss_fwd + loss_ficc
+        
+        
+        
+        loss = loss_rec + loss_cycle_rec + loss_inv
         
         metrics['loss_rec'] = loss_rec.item()
-        metrics['loss_cls'] = loss_cls.item() if self.cls_weight > 0 else 0
+        metrics['loss_cycle_rec'] = loss_cycle_rec.item()
+        # metrics['loss_cls'] = loss_cls.item() if self.cls_weight > 0 else 0
         metrics['loss_inv'] = loss_inv.item() if self.inv_weight > 0 else 0
-        metrics['loss_ficc_act'] = loss_act_rec.item() * self.ficc_weight if self.ficc_weight > 0 else 0
-        metrics['loss_ficc_ob'] = loss_ob_rep_next_rec.item() * self.ficc_weight if self.ficc_weight > 0 else 0
-        metrics['loss_ficc'] = loss_ficc.item() if self.ficc_weight > 0 else 0
+        # metrics['loss_ficc_act'] = loss_act_rec.item() * self.ficc_weight if self.ficc_weight > 0 else 0
+        # metrics['loss_ficc_ob'] = loss_ob_rep_next_rec.item() * self.ficc_weight if self.ficc_weight > 0 else 0
+        # metrics['loss_ficc'] = loss_ficc.item() if self.ficc_weight > 0 else 0
         
-        self.action_ae_opt.zero_grad()
-        if self.cls_weight > 0:
-            self.task_cls_opt.zero_grad()
+        self.action_ae_1_opt.zero_grad()
+        self.action_ae_2_opt.zero_grad()
+        # if self.cls_weight > 0:
+        #     self.task_cls_opt.zero_grad()
         if self.inv_weight > 0:
             self.inv_dyn_opt.zero_grad()
-        if self.fwd_weight > 0:
-            self.fwd_dyn_opt.zero_grad()
-        if self.ficc_weight > 0:
-            self.ficc_opt.zero_grad()
+        # if self.fwd_weight > 0:
+        #     self.fwd_dyn_opt.zero_grad()
+        # if self.ficc_weight > 0:
+        #     self.ficc_opt.zero_grad()
             
         loss.backward()
-        self.action_ae_opt.step()
-        if self.cls_weight > 0:
-            self.task_cls_opt.step()
+        self.action_ae_1_opt.step()
+        self.action_ae_2_opt.step()
+        # if self.cls_weight > 0:
+        #     self.task_cls_opt.step()
         if self.inv_weight > 0:
             self.inv_dyn_opt.step()
-        if self.ficc_weight > 0:
-            self.ficc_opt.step()
+        # if self.ficc_weight > 0:
+        #     self.ficc_opt.step()
         return metrics
 
     def update(self, replay_iter, step, stage, use_sensor):
         # for stage 2 and 3, we use the same functions but with different hyperparameters
         assert stage in ["BC", "DAPG"]
         metrics = dict()
-        self.action_ae.eval()
+        self.action_ae_1.eval()
+        self.action_ae_2.eval()
 
         if stage == "BC":
             update_encoder = self.stage2_update_encoder
@@ -706,70 +746,104 @@ class TARAgent:
             bc_weight = self.stage3_bc_lam0 * self.stage3_bc_lam1 ** i_iter
 
         # batch data
-        batch = next(replay_iter)
+        batch_1 = next(replay_iter[0])
+        batch_2 = next(replay_iter[1])
         if use_sensor: # TODO might want to...?
-            obs, action, reward, discount, next_obs, obs_sensor, obs_sensor_next = utils.to_torch(batch, self.device)
+            obs_1, action_1, reward_1, discount_1, next_obs_1, obs_sensor_1, obs_sensor_next_1 = utils.to_torch(batch_1, self.device)
+            obs_2, action_2, reward_2, discount_2, next_obs_2, obs_sensor_2, obs_sensor_next_2 = utils.to_torch(batch_2, self.device)
         else:
-            obs, action, reward, discount, next_obs = utils.to_torch(batch, self.device)
-            obs_sensor, obs_sensor_next = None, None
+            obs_1, action_1, reward_1, discount_1, next_obs_1 = utils.to_torch(batch_1, self.device)
+            obs_sensor_1, obs_sensor_next_1 = None, None
+            obs_2, action_2, reward_2, discount_2, next_obs_2 = utils.to_torch(batch_2, self.device)
+            obs_sensor_2, obs_sensor_next_2 = None, None
 
         # augment
         if self.use_data_aug:
-            obs = self.aug(obs.float())
-            next_obs = self.aug(next_obs.float())
+            obs_1 = self.aug(obs_1.float())
+            next_obs_1 = self.aug(next_obs_1.float())
+            obs_2 = self.aug(obs_2.float())
+            next_obs_2 = self.aug(next_obs_2.float())
         else:
-            obs = obs.float()
-            next_obs = next_obs.float()
+            obs_1 = obs_1.float()
+            next_obs_1 = next_obs_1.float()
+            obs_2 = obs_2.float()
+            next_obs_2 = next_obs_2.float()
 
         # encode
         if update_encoder:
-            obs = self.encoder(obs)
+            obs_1 = self.encoder(obs_1)
+            obs_2 = self.encoder(obs_2)
         else:
             with torch.no_grad():
-                obs = self.encoder(obs)
+                obs_1 = self.encoder(obs_1)
+                obs_2 = self.encoder(obs_2)
 
         with torch.no_grad():
-            next_obs = self.encoder(next_obs)
-            act_rep = self.action_ae.encode(action)[0]
+            next_obs_1 = self.encoder(next_obs_1)
+            next_obs_2 = self.encoder(next_obs_2)
+        act_rep_1 = self.action_ae_1.encode(action_1)
+        act_rep_2 = self.action_ae_2.encode(action_2)
+                           
         if update_autoencoder:
-            act_rec = self.action_ae.forward(action)[0]
+            act_rec_1 = self.action_ae_1.forward(action_1)
+            act_rec_2 = self.action_ae_2.forward(action_2)
+            act_cycle_rec_1 = self.action_ae_1.decode(self.action_ae_2.encode(self.action_ae_2.decode(self.action_ae_1.encode(action_1))))
+            act_cycle_rec_2 = self.action_ae_2.decode(self.action_ae_1.encode(self.action_ae_1.decode(self.action_ae_2.encode(action_2))))
+            act_rep_rec_1 = self.inv_dyn(obs_1.detach(), next_obs_1)
+            act_rep_rec_2 = self.inv_dyn(obs_2.detach(), next_obs_2)
+            loss_inv_1 = F.mse_loss(act_rep_rec_1.detach(), act_rep_1) + F.mse_loss(act_rep_rec_1, act_rep_1.detach())
+            loss_inv_2 = F.mse_loss(act_rep_rec_2.detach(), act_rep_2) + F.mse_loss(act_rep_rec_2, act_rep_2.detach())
+            loss_inv = (loss_inv_1 + loss_inv_2)/2
         else:
             with torch.no_grad():
-                act_rec = self.action_ae.forward(action)[0]
+                act_rec_1 = self.action_ae_1.forward(action_1)
+                act_rec_2 = self.action_ae_2.forward(action_2)
+                act_cycle_rec_1 = self.action_ae_1.decode(self.action_ae_2.encode(self.action_ae_2.decode(self.action_ae_1.encode(action_1))))
+                act_cycle_rec_2 = self.action_ae_2.decode(self.action_ae_1.encode(self.action_ae_1.decode(self.action_ae_2.encode(action_2))))
+                loss_inv = 0
         
-        loss_rec_rl = F.mse_loss(act_rec, action)
-        metrics['loss_rec_rl'] = F.mse_loss(act_rec, action).item()
+
+        loss_cycle_rec_rl =  F.mse_loss(act_cycle_rec_1, action_1) + F.mse_loss(act_cycle_rec_2, action_2)
+        loss_rec_rl = F.mse_loss(act_rec_1, action_1) + F.mse_loss(act_rec_2, action_2)
+        loss = loss_inv + loss_rec_rl + loss_cycle_rec_rl
+        metrics['loss_rec_rl'] = loss_rec_rl.item()
+        metrics['loss_cycle_rec_rl'] = loss_cycle_rec_rl.item()
+        
         if update_autoencoder:
-            self.action_ae_opt.zero_grad()
-            loss_rec_rl.backward()
-            self.action_ae_opt.step()
+            self.action_ae_1_opt.zero_grad()
+            self.action_ae_2_opt.zero_grad()
+            loss.backward()
+            self.action_ae_1_opt.step()
+            self.action_ae_2_opt.step()
             
 
         # concatenate obs with additional sensor observation if needed
-        obs_combined = torch.cat([obs, obs_sensor], dim=1) if obs_sensor is not None else obs
-        obs_next_combined = torch.cat([next_obs, obs_sensor_next], dim=1) if obs_sensor_next is not None else next_obs
+        obs_combined_1 = torch.cat([obs_1, obs_sensor_1], dim=1) if obs_sensor_1 is not None else obs_1
+        obs_next_combined_1 = torch.cat([next_obs_1, obs_sensor_next_1], dim=1) if obs_sensor_next_1 is not None else next_obs_1
+        obs_combined_2 = torch.cat([obs_2, obs_sensor_2], dim=1) if obs_sensor_2 is not None else obs_2
+        obs_next_combined_2 = torch.cat([next_obs_2, obs_sensor_next_2], dim=1) if obs_sensor_next_2 is not None else next_obs_2
 
         # update critic
-        metrics.update(self.update_critic(obs_combined, act_rep, reward, discount, obs_next_combined,
+        metrics.update(self.update_critic(obs_combined_1, obs_combined_2, act_rep_1.detach(), act_rep_2.detach(), reward_1, reward_2, discount_1, discount_2, obs_next_combined_1, obs_next_combined_2,
                                                stddev, update_encoder, conservative_loss_weight))
 
         # update actor, following previous works, we do not use actor gradient for encoder update
         if self.policy_output_type == "action":
-            metrics.update(self.update_actor(obs_combined.detach(), action, stddev, bc_weight,
+            metrics.update(self.update_actor(obs_combined_1.detach(), obs_combined_2.detach(), action_1, action_2, stddev, bc_weight,
                                                   self.pretanh_penalty, self.pretanh_threshold))
         else:
-            metrics.update(self.update_actor(obs_combined.detach(), act_rep, stddev, bc_weight,
+            metrics.update(self.update_actor(obs_combined_1.detach(), obs_combined_2.detach(), act_rep_1.detach(), act_rep_2.detach(), stddev, bc_weight,
                                               self.pretanh_penalty, self.pretanh_threshold))
 
-        metrics['batch_reward'] = reward.mean().item()
+        metrics['batch_reward'] = (reward_1.mean().item() + reward_2.mean().item()) / 2
 
         # update critic target networks
         utils.soft_update_params(self.critic, self.critic_target, self.critic_target_tau)
         return metrics
 
-    def update_critic(self, obs, action, reward, discount, next_obs, stddev, update_encoder, conservative_loss_weight):
+    def update_critic(self, obs_1, obs_2, action_1, action_2, reward_1, reward_2, discount_1, discount_2, next_obs_1, next_obs_2, stddev, update_encoder, conservative_loss_weight):
         metrics = dict()
-        batch_size = obs.shape[0]
+        batch_size = obs_1.shape[0]
 
         """
         STANDARD Q LOSS COMPUTATION:
@@ -777,19 +851,28 @@ class TARAgent:
         - except for the safe Q technique, which controls how large the Q value can be
         """
         with torch.no_grad():
-            dist = self.actor(next_obs, stddev)
-            next_action = dist.sample(clip=self.stddev_clip)
+            dist_1 = self.actor(next_obs_1, stddev)
+            dist_2 = self.actor(next_obs_2, stddev)
+            next_action_1 = dist_1.sample(clip=self.stddev_clip)
+            next_action_2 = dist_2.sample(clip=self.stddev_clip)
             if self.policy_output_type == 'action': 
-                next_action = self.action_ae.encode(next_action)[0]
-            target_Q1, target_Q2 = self.critic_target(next_obs, next_action)
-            target_V = torch.min(target_Q1, target_Q2)
-            target_Q = reward + (discount * target_V)
+                next_action_1 = self.action_ae_1.encode(next_action_1)
+                next_action_2 = self.action_ae_2.encode(next_action_2)
+            target_Q1_1, target_Q2_1 = self.critic_target(next_obs_1, next_action_1)
+            target_Q1_2, target_Q2_2 = self.critic_target(next_obs_2, next_action_2)
+            target_V_1 = torch.min(target_Q1_1, target_Q2_1)
+            target_V_2 = torch.min(target_Q1_2, target_Q2_2)
+            target_Q_1 = reward_1 + (discount_1 * target_V_1)
+            target_Q_2 = reward_2 + (discount_2 * target_V_2)
+            
 
             if self.safe_q_target_factor < 1:
-                target_Q[target_Q > (self.q_threshold + 1)] = self.q_threshold + (target_Q[target_Q > (self.q_threshold+1)] - self.q_threshold) ** self.safe_q_target_factor
+                target_Q_1[target_Q_1 > (self.q_threshold + 1)] = self.q_threshold + (target_Q_1[target_Q_1 > (self.q_threshold+1)] - self.q_threshold) ** self.safe_q_target_factor
+                target_Q_2[target_Q_2 > (self.q_threshold + 1)] = self.q_threshold + (target_Q_2[target_Q_2 > (self.q_threshold+1)] - self.q_threshold) ** self.safe_q_target_factor
 
-        Q1, Q2 = self.critic(obs, action)
-        critic_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
+        Q1_1, Q2_1 = self.critic(obs_1, action_1)
+        Q1_2, Q2_2 = self.critic(obs_2, action_2)
+        critic_loss = (F.mse_loss(Q1_1, target_Q_1) + F.mse_loss(Q2_1, target_Q_1) + F.mse_loss(Q1_2, target_Q_2) + F.mse_loss(Q2_2, target_Q_2))/2
 
         """
         CONSERVATIVE Q LOSS COMPUTATION:
@@ -799,49 +882,72 @@ class TARAgent:
         """
         if conservative_loss_weight > 0:
             random_actions = (torch.rand((batch_size * self.cql_n_random, self.act_dim), device=self.device) - 0.5) * 2
-            random_actions = self.action_ae.encode(random_actions)[0]
+            random_actions_1 = self.action_ae_1.encode(random_actions)
+            random_actions_2 = self.action_ae_2.encode(random_actions)
 
-            dist = self.actor(obs, stddev)
-            current_actions = dist.sample(clip=self.stddev_clip)
+            dist_1 = self.actor(obs_1, stddev)
+            current_actions_1 = dist_1.sample(clip=self.stddev_clip)
+            dist_2 = self.actor(obs_2, stddev)
+            current_actions_2 = dist_2.sample(clip=self.stddev_clip)
 
-            dist = self.actor(next_obs, stddev)
-            next_current_actions = dist.sample(clip=self.stddev_clip)
+            dist_1 = self.actor(next_obs_1, stddev)
+            next_current_actions_1 = dist_1.sample(clip=self.stddev_clip)
+            dist_2 = self.actor(next_obs_2, stddev)
+            next_current_actions_2 = dist_2.sample(clip=self.stddev_clip)
             
             if self.policy_output_type == 'action': 
-                current_actions = self.action_ae.encode(current_actions)[0]
-                next_current_actions = self.action_ae.encode(next_current_actions)[0]
+                current_actions_1 = self.action_ae_1.encode(current_actions_1)
+                next_current_actions_1 = self.action_ae_1.encode(next_current_actions_1)
+                current_actions_2 = self.action_ae_2.encode(current_actions_2)
+                next_current_actions_2 = self.action_ae_2.encode(next_current_actions_2)
 
             # now get Q values for all these actions (for both Q networks)
-            obs_repeat = obs.unsqueeze(1).repeat(1, self.cql_n_random, 1).view(obs.shape[0] * self.cql_n_random,
-                                                                               obs.shape[1])
+            obs_repeat_1 = obs_1.unsqueeze(1).repeat(1, self.cql_n_random, 1).view(obs_1.shape[0] * self.cql_n_random,
+                                                                               obs_1.shape[1])
+            obs_repeat_2 = obs_2.unsqueeze(1).repeat(1, self.cql_n_random, 1).view(obs_2.shape[0] * self.cql_n_random,
+                                                                               obs_2.shape[1])
+            Q1_rand_1, Q2_rand_1 = self.critic(obs_repeat_1,
+                                           random_actions_1)  # TODO might want to double check the logic here see if the repeat is correct
+            Q1_rand_1 = Q1_rand_1.view(obs_1.shape[0], self.cql_n_random)
+            Q2_rand_1 = Q2_rand_1.view(obs_1.shape[0], self.cql_n_random)
+            Q1_rand_2, Q2_rand_2 = self.critic(obs_repeat_2,
+                                           random_actions_2)  # TODO might want to double check the logic here see if the repeat is correct
+            Q1_rand_2 = Q1_rand_2.view(obs_2.shape[0], self.cql_n_random)
+            Q2_rand_2 = Q2_rand_2.view(obs_2.shape[0], self.cql_n_random)
 
-            Q1_rand, Q2_rand = self.critic(obs_repeat,
-                                           random_actions)  # TODO might want to double check the logic here see if the repeat is correct
-            Q1_rand = Q1_rand.view(obs.shape[0], self.cql_n_random)
-            Q2_rand = Q2_rand.view(obs.shape[0], self.cql_n_random)
-
-            Q1_curr, Q2_curr = self.critic(obs, current_actions)
-            Q1_curr_next, Q2_curr_next = self.critic(obs, next_current_actions)
+            Q1_curr_1, Q2_curr_1 = self.critic(obs_1, current_actions_1)
+            Q1_curr_next_1, Q2_curr_next_1 = self.critic(obs_1, next_current_actions_1)
+            Q1_curr_2, Q2_curr_2 = self.critic(obs_2, current_actions_2)
+            Q1_curr_next_2, Q2_curr_next_2 = self.critic(obs_2, next_current_actions_2)
 
             # now concat all these Q values together
-            Q1_cat = torch.cat([Q1_rand, Q1, Q1_curr, Q1_curr_next], 1)
-            Q2_cat = torch.cat([Q2_rand, Q2, Q2_curr, Q2_curr_next], 1)
+            Q1_cat_1 = torch.cat([Q1_rand_1, Q1_1, Q1_curr_1, Q1_curr_next_1], 1)
+            Q2_cat_1 = torch.cat([Q2_rand_1, Q2_1, Q2_curr_1, Q2_curr_next_1], 1)
+            Q1_cat_2 = torch.cat([Q1_rand_2, Q1_2, Q1_curr_2, Q1_curr_next_2], 1)
+            Q2_cat_2 = torch.cat([Q2_rand_2, Q2_2, Q2_curr_2, Q2_curr_next_2], 1)
 
-            cql_min_q1_loss = torch.logsumexp(Q1_cat / self.cql_temp,
+            cql_min_q1_loss_1 = torch.logsumexp(Q1_cat_1 / self.cql_temp,
                                               dim=1, ).mean() * conservative_loss_weight * self.cql_temp
-            cql_min_q2_loss = torch.logsumexp(Q2_cat / self.cql_temp,
+            cql_min_q2_loss_1 = torch.logsumexp(Q2_cat_1 / self.cql_temp,
                                               dim=1, ).mean() * conservative_loss_weight * self.cql_temp
+            cql_min_q1_loss_2 = torch.logsumexp(Q1_cat_2 / self.cql_temp,
+                                                dim=1, ).mean() * conservative_loss_weight * self.cql_temp
+            cql_min_q2_loss_2 = torch.logsumexp(Q2_cat_2 / self.cql_temp,
+                                                dim=1, ).mean() * conservative_loss_weight * self.cql_temp
 
             """Subtract the log likelihood of data"""
-            conservative_q_loss = cql_min_q1_loss + cql_min_q2_loss - (Q1.mean() + Q2.mean()) * conservative_loss_weight
+            conservative_q_loss = (cql_min_q1_loss_1 + cql_min_q2_loss_1 + cql_min_q1_loss_2 + cql_min_q2_loss_2 - (Q1_1.mean() + Q2_1.mean() + Q1_2.mean() + Q2_2.mean()) * conservative_loss_weight)/ 2
             critic_loss_combined = critic_loss + conservative_q_loss
         else:
             critic_loss_combined = critic_loss
 
         # logging
-        metrics['critic_target_q'] = target_Q.mean().item()
-        metrics['critic_q1'] = Q1.mean().item()
-        metrics['critic_q2'] = Q2.mean().item()
+        # metrics['critic_target_q_1'] = target_Q_1.mean().item()
+        # metrics['critic_q1_1'] = Q1_1.mean().item()
+        # metrics['critic_q2_1'] = Q2_1.mean().item()
+        # metrics['critic_target_q_2'] = target_Q_2.mean().item()
+        # metrics['critic_q1_2'] = Q1_2.mean().item()
+        # metrics['critic_q2_2'] = Q2_2.mean().item()
         metrics['critic_loss'] = critic_loss.item()
 
         # if needed, also update encoder with critic loss
@@ -855,20 +961,29 @@ class TARAgent:
 
         return metrics
 
-    def update_actor(self, obs, action, stddev, bc_weight, pretanh_penalty, pretanh_threshold):
+    def update_actor(self, obs_1, obs_2, action_1, action_2, stddev, bc_weight, pretanh_penalty, pretanh_threshold):
         metrics = dict()
 
         """
         get standard actor loss
         """
-        dist, pretanh = self.actor.forward_with_pretanh(obs, stddev)
-        current_action = dist.sample(clip=self.stddev_clip)
-        log_prob = dist.log_prob(current_action).sum(-1, keepdim=True)
+        dist_1, pretanh_1 = self.actor.forward_with_pretanh(obs_1, stddev)
+        current_action_1 = dist_1.sample(clip=self.stddev_clip)
+        log_prob_1 = dist_1.log_prob(current_action_1).sum(-1, keepdim=True)
         if self.policy_output_type == 'action':
-            current_action = self.action_ae.encode(current_action)[0]
-        Q1, Q2 = self.critic(obs, current_action)
-        Q = torch.min(Q1, Q2)
-        actor_loss = -Q.mean()
+            current_action_1 = self.action_ae_1.encode(current_action_1)
+        Q1_1, Q2_1 = self.critic(obs_1, current_action_1)
+        Q_1 = torch.min(Q1_1, Q2_1)
+        
+        dist_2, pretanh_2 = self.actor.forward_with_pretanh(obs_2, stddev)
+        current_action_2 = dist_2.sample(clip=self.stddev_clip)
+        log_prob_2 = dist_2.log_prob(current_action_2).sum(-1, keepdim=True)
+        if self.policy_output_type == 'action':
+            current_action_2 = self.action_ae_2.encode(current_action_2)
+        Q1_2, Q2_2 = self.critic(obs_2, current_action_2)
+        Q_2 = torch.min(Q1_2, Q2_2)
+        
+        actor_loss = -(Q_1.mean() + Q_2.mean())/ 2
 
         """
         add BC loss
@@ -876,18 +991,24 @@ class TARAgent:
         if bc_weight > 0:
             # get mean action with no action noise (though this might not be necessary)
             stddev_bc = 0
-            dist_bc = self.actor(obs, stddev_bc)
-            current_mean_action = dist_bc.sample(clip=self.stddev_clip)
-            actor_loss_bc = F.mse_loss(current_mean_action, action) * bc_weight
+            dist_bc_1 = self.actor(obs_1, stddev_bc)
+            current_mean_action_1 = dist_bc_1.sample(clip=self.stddev_clip)
+            actor_loss_bc_1 = F.mse_loss(current_mean_action_1, action_1) * bc_weight
+            dist_bc_2 = self.actor(obs_2, stddev_bc)
+            current_mean_action_2 = dist_bc_2.sample(clip=self.stddev_clip)
+            actor_loss_bc_2 = F.mse_loss(current_mean_action_2, action_2) * bc_weight
         else:
-            actor_loss_bc = torch.FloatTensor([0]).to(self.device)
-
+            actor_loss_bc_1 = torch.FloatTensor([0]).to(self.device)
+            actor_loss_bc_2 = torch.FloatTensor([0]).to(self.device)
+            
+        actor_loss_bc = (actor_loss_bc_1 + actor_loss_bc_2) / 2
+        
         """
         add pretanh penalty (might not be necessary for Adroit)
         """
         pretanh_loss = 0
         if pretanh_penalty > 0:
-            pretanh_loss = pretanh.abs() - pretanh_threshold
+            pretanh_loss = (pretanh_1.abs() + pretanh_2.abs())/ 2 - pretanh_threshold
             pretanh_loss[pretanh_loss < 0] = 0
             pretanh_loss = (pretanh_loss ** 2).mean() * pretanh_penalty
 
@@ -902,10 +1023,14 @@ class TARAgent:
 
         metrics['actor_loss'] = actor_loss.item()
         metrics['actor_loss_bc'] = actor_loss_bc.item()
-        metrics['actor_logprob'] = log_prob.mean().item()
-        metrics['actor_ent'] = dist.entropy().sum(dim=-1).mean().item()
-        metrics['abs_pretanh'] = pretanh.abs().mean().item()
-        metrics['max_abs_pretanh'] = pretanh.abs().max().item()
+        # metrics['actor_logprob_1'] = log_prob_1.mean().item()
+        # metrics['actor_ent_1'] = dist_1.entropy().sum(dim=-1).mean().item()
+        # metrics['abs_pretanh_1'] = pretanh_1.abs().mean().item()
+        # metrics['max_abs_pretan_1'] = pretanh_1.abs().max().item()
+        # metrics['actor_logprob_2'] = log_prob_2.mean().item()
+        # metrics['actor_ent_2'] = dist_2.entropy().sum(dim=-1).mean().item()
+        # metrics['abs_pretanh_2'] = pretanh_2.abs().mean().item()
+        # metrics['max_abs_pretan_2'] = pretanh_2.abs().max().item()
 
         return metrics
 

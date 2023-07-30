@@ -18,37 +18,13 @@ COMMON_TRAIN_FORMAT = [('frame', 'F', 'int'), ('step', 'S', 'int'),
                        ('episode_reward', 'R', 'float'),
                        ('buffer_size', 'BS', 'int'), ('fps', 'FPS', 'float'),
                        ('total_time', 'T', 'time')]
-# COMMON_TRAIN_FORMAT = [('frame', 'F', 'int'), ('step', 'S', 'int'),
-#                        ('episode', 'E', 'int'), ('episode_length', 'L', 'int'),
-#                        ('episode_reward', 'R', 'float'),
-#                        ('buffer_size', 'BS', 'int'), ('fps', 'FPS', 'float'),
-#                        ('total_time', 'T', 'time') ,
-#                        ('episode_length_0', 'L0', 'int'),
-#                        ('episode_length_1', 'L1', 'int'),
-#                        ('episode_reward_0', 'R0', 'float'),
-#                        ('episode_reward_1', 'R1', 'float'),
-#                       ]
 
-COMMON_EVAL_FORMAT = [('frame', 'F', 'int'),
-                      ('episode_length', 'L', 'int'),
+COMMON_EVAL_FORMAT = [('frame', 'F', 'int'), ('step', 'S', 'int'),
+                      ('episode', 'E', 'int'), ('episode_length', 'L', 'int'),
                       ('episode_reward', 'R', 'float'),
-                      ('step', 'S', 'int'),
-                      ('episode', 'E', 'int'),
-                      ]
+                      ('total_time', 'T', 'time')]
 
-OTHER_FORMAT = [('critic_loss', 'CL', 'float'), 
-                ('actor_loss', 'AL', 'float'),
-                ('actor_loss_bc', 'AL_BC', 'float'),
-                ('loss_rec', 'LR', 'float'),
-                ('loss_rec_rl', 'LR_RL', 'float'),
-                ('loss_inv', 'LI', 'float'),
-                ('loss_fwd', 'LF', 'float'),
-                ('batch_reward', 'BR', 'float'),
-                ]
 
-ALL_FORMAT = COMMON_EVAL_FORMAT + OTHER_FORMAT
-
-FIELD_NAMES = [f for f, _, _ in ALL_FORMAT]
 
 class AverageMeter(object):
     def __init__(self):
@@ -148,7 +124,9 @@ class MetersGroup(object):
 
 
 class Logger(object):
-    def __init__(self, project_id, exp_id, log_dir, use_wb, use_tb, stage2_logger=False):
+    def __init__(self, log_dir, use_wb, use_tb, stage2_logger=False):
+        if not log_dir.exists():
+            log_dir.mkdir(parents=True)
         self._log_dir = log_dir
         self.use_wb = use_wb
         self.use_tb = use_tb
@@ -162,8 +140,6 @@ class Logger(object):
                                          formating=COMMON_TRAIN_FORMAT)
             self._eval_mg = MetersGroup(log_dir / 'eval_stage2.csv',
                                         formating=COMMON_EVAL_FORMAT)
-        if use_wb:
-            wandb.init(project=project_id, dir=str(log_dir), id=exp_id)
             
         if use_tb:
             self._sw = SummaryWriter(str(log_dir / 'tb'))

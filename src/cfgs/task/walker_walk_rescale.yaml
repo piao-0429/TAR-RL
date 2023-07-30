@@ -1,0 +1,14 @@
+defaults:
+  - easy
+  - _self_
+
+embodiment_type: 'rescale'
+task_names: 
+  - walker_walk_1
+  - walker_walk_2
+  - walker_walk_3
+  # - walker_walk_4
+  # - walker_walk_5
+  # - walker_walk_6
+nstep: 1
+batch_size: 512

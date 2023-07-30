@@ -146,6 +146,78 @@ class TrajBuffer(IterableDataset):
         while True:
             yield self._sample()
 
+class CrossEmbodimentTrajBuffer(IterableDataset):
+    def __init__(self, replay_dir, max_size, num_workers, seq_len, fetch_every,
+                 save_snapshot, is_adroit=False, return_next_action=False):
+        self._replay_dir = replay_dir
+        self._size = 0
+        self._max_size = max_size
+        self._num_workers = max(1, num_workers)
+        self.seq_len = seq_len
+        self._episode_fns = []
+        self._episodes = dict()
+        self._fetch_every = fetch_every
+        self._samples_since_last_fetch = fetch_every
+        self._save_snapshot = save_snapshot
+        self._is_adroit = is_adroit
+        self._return_next_action = return_next_action
+
+
+    def _sample_episode(self):
+        eps_fn = random.choice(self._episode_fns)
+        return self._episodes[eps_fn]
+
+    def _store_episode(self, eps_fn):
+        try:
+            episode = load_episode(eps_fn)
+        except:
+            return False
+        self._episode_fns.append(eps_fn)
+        self._episode_fns.sort()
+        self._episodes[eps_fn] = episode
+        self._size += 1
+
+        if not self._save_snapshot:
+            eps_fn.unlink(missing_ok=True)
+        return True
+    
+    def _try_fetch(self):
+        if self._samples_since_last_fetch < self._fetch_every:
+            return
+        self._samples_since_last_fetch = 0
+        try:
+            worker_id = torch.utils.data.get_worker_info().id
+        except:
+            worker_id = 0
+        eps_fns = sorted(self._replay_dir.glob('*.npz'), reverse=True)
+        fetched_size = 0
+        for eps_fn in eps_fns:
+            eps_idx, _ = [int(x) for x in eps_fn.stem.split('_')[1:]]
+            if eps_idx % self._num_workers != worker_id:
+                continue
+            if eps_fn in self._episodes.keys():
+                break
+            if fetched_size + 1 > self._max_size:
+                break
+            fetched_size += 1
+            if not self._store_episode(eps_fn):
+                break
+
+    def _sample(self):
+        try:
+            self._try_fetch()
+        except:
+            traceback.print_exc()
+        self._samples_since_last_fetch += 1
+        episode = self._sample_episode()
+        actions = episode['action_seq'][0]
+        label = episode['action_label'][0]
+        embodiment = episode['embodiment'][0]
+        return actions, label, embodiment
+
+    def __iter__(self):
+        while True:
+            yield self._sample()
 
 def _worker_init_fn(worker_id):
     seed = np.random.get_state()[1][0] + worker_id

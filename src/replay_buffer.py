@@ -184,6 +184,84 @@ class ReplayBuffer(IterableDataset):
         while True:
             yield self._sample()
 
+class CrossEmbodimentReplayBufferStorage(ReplayBufferStorage): 
+    def __init__(self, data_specs, replay_dir, n):
+        super().__init__(data_specs, replay_dir)
+        self._current_episodes = [defaultdict(list) for _ in range(n)]
+        
+    
+    def add(self, time_step, id):
+        for spec in self._data_specs:
+            if spec.name == 'embodiment_id':
+                value = id
+            else:
+                value = time_step[spec.name]
+            if np.isscalar(value):
+                value = np.full(spec.shape, value, spec.dtype)
+            # print(spec.name, spec.shape, spec.dtype, value.shape, value.dtype)
+            assert spec.shape == value.shape and spec.dtype == value.dtype
+            self._current_episodes[id][spec.name].append(value)
+        if time_step.last():
+            episode = dict()
+            for spec in self._data_specs:
+                value = self._current_episodes[id][spec.name]
+                episode[spec.name] = np.array(value, spec.dtype)
+            self._current_episodes[id] = defaultdict(list)
+            self._store_episode(episode)
+    
+    # def _store_episode(self, episode, id):
+    #     eps_idx = self._num_episodes
+    #     eps_len = episode_len(episode)
+    #     self._num_episodes += 1
+    #     self._num_transitions += eps_len
+    #     ts = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
+    #     eps_fn = f'{ts}_{eps_idx}_{eps_len}_{id}.npz'
+    #     save_episode(episode, self._replay_dir / eps_fn)
+        
+                   
+class CrossEmbodimentReplayBuffer(ReplayBuffer):
+    def __init__(self, replay_dir, max_size, num_workers, nstep, discount,
+                 fetch_every, save_snapshot, use_sensor=False, return_next_action=False):
+        super().__init__(replay_dir, max_size, num_workers, nstep, discount,
+                         fetch_every, save_snapshot, use_sensor, return_next_action)
+        self._use_sensor = use_sensor
+
+    def _sample(self):
+        try:
+            self._try_fetch()
+        except:
+            traceback.print_exc()
+        self._samples_since_last_fetch += 1
+        episode = self._sample_episode()
+        # add +1 for the first dummy transition
+        idx = np.random.randint(0, episode_len(episode) - self._nstep + 1) + 1
+        obs = episode['observation'][idx - 1]
+        action = episode['action'][idx]
+        next_obs = episode['observation'][idx + self._nstep - 1]
+        reward = np.zeros_like(episode['reward'][idx])
+        discount = np.ones_like(episode['discount'][idx])
+        id = episode['embodiment_id'][idx]
+        for i in range(self._nstep):
+            step_reward = episode['reward'][idx + i]
+            reward += discount * step_reward
+            discount *= episode['discount'][idx + i] * self._discount
+
+        if self._return_next_action:
+            next_action = episode['action'][idx + self._nstep - 1]
+
+        if not self._use_sensor:
+            if self._return_next_action:
+                return (obs, action, reward, discount, next_obs, next_action, id)
+            else:
+                return (obs, action, reward, discount, next_obs, id)
+        else:
+            obs_sensor = episode['observation_sensor'][idx - 1]
+            obs_sensor_next = episode['observation_sensor'][idx + self._nstep - 1]
+            if self._return_next_action:
+                return (obs, action, reward, discount, next_obs, obs_sensor, obs_sensor_next, next_action, id)
+            else:
+                return (obs, action, reward, discount, next_obs, obs_sensor, obs_sensor_next, id)
+
 
 def _worker_init_fn(worker_id):
     seed = np.random.get_state()[1][0] + worker_id
@@ -203,6 +281,48 @@ def make_replay_loader(replay_dir, max_size, batch_size, num_workers,
                             fetch_every=fetch_every,
                             save_snapshot=save_snapshot, 
                             is_adroit=is_adroit,
+                            return_next_action=return_next_action)
+
+    loader = torch.utils.data.DataLoader(iterable,
+                                         batch_size=batch_size,
+                                         num_workers=num_workers,
+                                         pin_memory=True,
+                                         worker_init_fn=_worker_init_fn)
+    return loader
+
+def make_replay_loader(replay_dir, max_size, batch_size, num_workers,
+                       save_snapshot, nstep, discount, fetch_every=1000, is_adroit=False, return_next_action=False):
+    max_size_per_worker = max_size // max(1, num_workers)
+
+    iterable = ReplayBuffer(replay_dir,
+                            max_size_per_worker,
+                            num_workers,
+                            nstep,
+                            discount,
+                            fetch_every=fetch_every,
+                            save_snapshot=save_snapshot, 
+                            is_adroit=is_adroit,
+                            return_next_action=return_next_action)
+
+    loader = torch.utils.data.DataLoader(iterable,
+                                         batch_size=batch_size,
+                                         num_workers=num_workers,
+                                         pin_memory=True,
+                                         worker_init_fn=_worker_init_fn)
+    return loader
+
+def make_cross_embodiment_replay_loader(replay_dir, max_size, batch_size, num_workers,
+                       save_snapshot, nstep, discount, fetch_every=1000, use_sensor=False, return_next_action=False):
+    max_size_per_worker = max_size // max(1, num_workers)
+
+    iterable = CrossEmbodimentReplayBuffer(replay_dir,
+                            max_size_per_worker,
+                            num_workers,
+                            nstep,
+                            discount,
+                            fetch_every=fetch_every,
+                            save_snapshot=save_snapshot, 
+                            use_sensor=use_sensor,
                             return_next_action=return_next_action)
 
     loader = torch.utils.data.DataLoader(iterable,

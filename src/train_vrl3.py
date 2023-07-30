@@ -45,7 +45,7 @@ if ENV_TYPE == 'adroit':
     from rrl_local.rrl_utils import make_basic_env, make_dir
     from adroit import AdroitEnv
 else:
-    import dmc
+    import envs.dmc.dmc as dmc
 IS_ADROIT = True if ENV_TYPE == 'adroit' else False
 
 def get_ram_info():

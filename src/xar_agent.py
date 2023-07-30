@@ -47,6 +47,13 @@ class RandomShiftsAug(nn.Module):
                              padding_mode='zeros',
                              align_corners=False)
 
+class Identity(nn.Module):
+    def __init__(self, input_placeholder=None):
+        super(Identity, self).__init__()
+
+    def forward(self, x):
+        return x
+
 class RLEncoder(nn.Module):
     def __init__(self, obs_shape, model_name, device):
         super().__init__()
@@ -196,7 +203,7 @@ class StochasticActionAE(nn.Module):
     def forward(self, x):
         z, enc_mu, enc_log_sigma = self.encode(x)
         x_rec, dec_mu, dec_log_sigma = self.decode(z)
-        return x_rec, x, enc_mu, enc_log_sigma
+        return x_rec
 
 class DeterministicActionAE(nn.Module):
     def __init__(self, action_dim, act_rep_dim, hidden_dim):
@@ -228,7 +235,72 @@ class DeterministicActionAE(nn.Module):
         z = self.encode(x)
         x_rec = self.decode(z)
         return x_rec
+
+class ActionEncoder(nn.Module):
+    def __init__(self, action_dim, act_rep_dim, hidden_dim, deterministic=True):
+        super(ActionEncoder, self).__init__()
+        self.action_dim = action_dim
+        self.latent_dim = act_rep_dim
+        self.hidden_dim = hidden_dim
+        self.mu_fc1 = nn.Linear(action_dim, hidden_dim)
+        self.mu_fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.mu_fc3 = nn.Linear(hidden_dim, act_rep_dim)
+        self.deterministic = deterministic
+        if not self.deterministic:
+            self.log_sigma_fc1 = nn.Linear(action_dim, hidden_dim)
+            self.log_sigma_fc2 = nn.Linear(hidden_dim, hidden_dim)
+            self.log_sigma_fc3 = nn.Linear(hidden_dim, act_rep_dim)
+            
+    def reparamize(self, mu, log_sigma):
+        std = torch.exp(log_sigma)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+        
+    def forward(self, x):
+        mu = F.relu(self.mu_fc1(x))
+        mu = F.relu(self.mu_fc2(mu))
+        mu = self.mu_fc3(mu)
+        if self.deterministic:
+            return mu, None, None
+        else:
+            log_sigma = F.relu(self.log_sigma_fc1(x))
+            log_sigma = F.relu(self.log_sigma_fc2(log_sigma))
+            log_sigma = self.log_sigma_fc3(log_sigma)
+            z = self.reparamize(mu, log_sigma)
+            return z, mu, log_sigma
+        
+class ActionDecoder(nn.Module):
+    def __init__(self, action_dim, act_rep_dim, hidden_dim, deterministic=True):
+        super(ActionDecoder, self).__init__()
+        self.action_dim = action_dim
+        self.latent_dim = act_rep_dim
+        self.hidden_dim = hidden_dim
+        self.mu_fc1 = nn.Linear(act_rep_dim, hidden_dim)
+        self.mu_fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.mu_fc3 = nn.Linear(hidden_dim, action_dim)
+        self.deterministic = deterministic
+        if not self.deterministic:
+            self.log_sigma_fc1 = nn.Linear(act_rep_dim, hidden_dim)
+            self.log_sigma_fc2 = nn.Linear(hidden_dim, hidden_dim)
+            self.log_sigma_fc3 = nn.Linear(hidden_dim, action_dim)
+
+    def reparamize(self, mu, log_sigma):
+        std = torch.exp(log_sigma)
+        eps = torch.randn_like(std)
+        return mu + eps * std
     
+    def forward(self, x):
+        mu = F.relu(self.mu_fc1(x))
+        mu = F.relu(self.mu_fc2(mu))
+        mu = self.mu_fc3(mu)
+        if self.deterministic:
+            return mu, None, None
+        else:
+            log_sigma = F.relu(self.log_sigma_fc1(x))
+            log_sigma = F.relu(self.log_sigma_fc2(log_sigma))
+            log_sigma = self.log_sigma_fc3(log_sigma)
+            z = self.reparamize(mu, log_sigma)
+            return z, mu, log_sigma
     
 class LatentInvDynMLP(nn.Module):
     def __init__(self, ob_rep_dim, act_rep_dim, hidden_dim):
@@ -373,19 +445,23 @@ class LatentCritic(nn.Module):
 
         return q1, q2
 
-class TARAgent:
-    def __init__(self, obs_shape, action_shape, act_rep_dim, seq_len, device, use_sensor, lr, feature_dim, hidden_dim, policy_output_type,
-                 cls_weight, inv_weight, fwd_weight, ficc_weight, critic_target_tau, num_expl_steps,
+class XARAgent:
+    def __init__(self, num_embodiments, obs_shape, action_shape, action_idx, act_rep_dim, device, use_sensor, lr, feature_dim, hidden_dim, policy_output_type,
+                 inv_weight, fwd_weight, kl_weight, critic_target_tau, num_expl_steps, deterministic_encoder, deterministic_decoder,
                  update_every_steps, stddev_clip, use_wb, use_data_aug, encoder_lr_scale,
                  visual_model_name, safe_q_target_factor, safe_q_threshold, pretanh_penalty, pretanh_threshold,
-                 stage2_update_encoder, stage2_update_autoencoder, cql_weight, cql_temp, cql_n_random, stage2_std, stage2_bc_weight,
-                 stage3_update_encoder, stage3_update_autoencoder, std0, std1, std_n_decay,
+                 stage2_update_visual_encoder, stage2_update_encoder, stage2_update_decoder, cql_weight, cql_temp, cql_n_random, stage2_std, stage2_bc_weight,
+                 stage3_update_visual_encoder, stage3_update_encoder, stage3_update_decoder, std0, std1, std_n_decay,
                  stage3_bc_lam0, stage3_bc_lam1,
                  data_dir):
+        self.num_embodiments = num_embodiments
         self.obs_shape = obs_shape
         assert self.obs_shape[0] % 3 == 0
         self.n_images = int(self.obs_shape[0] / 3)
         self.action_shape = action_shape
+        self.action_idx = action_idx
+        self.deterministic_encoder = deterministic_encoder
+        self.deterministic_decoder = deterministic_decoder
         self.device = device
         self.policy_output_type = policy_output_type
         self.critic_target_tau = critic_target_tau
@@ -395,8 +471,9 @@ class TARAgent:
         self.data_dir = data_dir
 
         self.stage2_std = stage2_std
+        self.stage2_update_visual_encoder = stage2_update_visual_encoder
         self.stage2_update_encoder = stage2_update_encoder
-        self.stage2_update_autoencoder = stage2_update_autoencoder
+        self.stage2_update_decoder = stage2_update_decoder
 
         if std1 > std0:
             std1 = std0
@@ -418,41 +495,41 @@ class TARAgent:
         self.stage3_bc_lam0 = stage3_bc_lam0
         self.stage3_bc_lam1 = stage3_bc_lam1
 
-        if stage3_update_encoder and encoder_lr_scale > 0 and len(obs_shape) > 1:
-            self.stage3_update_encoder = True
+        if stage3_update_visual_encoder and encoder_lr_scale > 0 and len(obs_shape) > 1:
+            self.stage3_update_visual_encoder = True
         else:
-            self.stage3_update_encoder = False
+            self.stage3_update_visual_encoder = False
 
-        self.stage3_update_autoencoder = stage3_update_autoencoder
+        self.stage3_update_encoder = stage3_update_encoder
+        self.stage3_update_decoder = stage3_update_decoder
 
-        # self.encoder = RLEncoder(obs_shape, visual_model_name, device).to(device)
         if visual_model_name == 'r3m50':
-            self.encoder = load_r3m('resnet50')
+            self.visual_encoder = load_r3m('resnet50')
         elif visual_model_name == 'r3m34':
-            self.encoder = load_r3m('resnet34')
+            self.visual_encoder = load_r3m('resnet34')
         elif visual_model_name == 'r3m18':
-            self.encoder = load_r3m('resnet18')
+            self.visual_encoder = load_r3m('resnet18')
         elif visual_model_name == 'resnet50':
-            self.encoder = resnet50(pretrained=True)
-            self.encoder.fc = nn.Identity()
+            self.visual_encoder = resnet50(pretrained=True)
+            self.visual_encoder.fc = nn.Identity()
         elif visual_model_name == 'resnet34':
-            self.encoder = resnet34(pretrained=True)
-            self.encoder.fc = nn.Identity()
+            self.visual_encoder = resnet34(pretrained=True)
+            self.visual_encoder.fc = nn.Identity()
         elif visual_model_name == 'resnet18':
-            self.encoder = resnet18(pretrained=True)
-            self.encoder.fc = nn.Identity()
+            self.visual_encoder = resnet18(pretrained=True)
+            self.visual_encoder.fc = nn.Identity()
         elif visual_model_name == 'vrl3':
-            self.encoder = RLEncoder(obs_shape, 'resnet6_32channel', device)
+            self.visual_encoder = RLEncoder(obs_shape, 'resnet6_32channel', device)
             self.load_pretrained_encoder(self.get_pretrained_model_path('resnet6_32channel'))
 
         self.expand_encoder(visual_model_name)
         
-        self.encoder.to(device)
-        self.encoder.eval()
+        self.visual_encoder.to(device)
+        self.visual_encoder.eval()
         
         with torch.no_grad():
             dummy_input = torch.zeros([1, self.obs_shape[0], 84, 84]).to(device)
-            dummy_input = self.encoder(dummy_input)
+            dummy_input = self.visual_encoder(dummy_input)
             ob_rep_dim = dummy_input.shape[1]
             
         if use_sensor:
@@ -460,14 +537,13 @@ class TARAgent:
             
         self.ob_rep_dim = ob_rep_dim
             
-        self.action_ae = StochasticActionAE(action_shape[0], act_rep_dim, hidden_dim).to(device)
-        self.task_cls = TaskDiscriminator(act_rep_dim, seq_len, hidden_dim).to(device)
+        self.action_encoder = ActionEncoder(action_shape[0], act_rep_dim, hidden_dim, deterministic_encoder).to(device)
+        self.action_decoder = ActionDecoder(action_shape[0], act_rep_dim, hidden_dim, deterministic_decoder).to(device)
         self.inv_dyn = LatentInvDynMLP(ob_rep_dim, act_rep_dim, hidden_dim).to(device)
         self.fwd_dyn = LatentForDynMLP(ob_rep_dim, act_rep_dim, hidden_dim).to(device)
         
         self.act_dim = action_shape[0]
         self.act_rep_dim = act_rep_dim
-        self.seq_len = seq_len
 
         if self.policy_output_type == 'latent':
             self.actor = LatentActor(ob_rep_dim, act_rep_dim, feature_dim,
@@ -481,25 +557,21 @@ class TARAgent:
                                     feature_dim, hidden_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        self.cls_weight = cls_weight
         self.inv_weight = inv_weight
         self.fwd_weight = fwd_weight
-        self.ficc_weight = ficc_weight
+        self.kl_weight = kl_weight
         
         # optimizers
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
-        
-        self.action_ae_opt = torch.optim.Adam(self.action_ae.parameters(), lr=lr)
-        self.action_ae_ft_opt = torch.optim.Adam(self.action_ae.parameters(), lr=lr*0.1)
-        self.task_cls_opt = torch.optim.Adam(self.task_cls.parameters(), lr=lr)
+        self.action_encoder_opt = torch.optim.Adam(self.action_encoder.parameters(), lr=lr)
+        self.action_decoder_opt = torch.optim.Adam(self.action_decoder.parameters(), lr=lr)
         self.inv_dyn_opt = torch.optim.Adam(self.inv_dyn.parameters(), lr=lr)
         self.fwd_dyn_opt = torch.optim.Adam(self.fwd_dyn.parameters(), lr=lr)
-        self.ficc_opt = torch.optim.Adam((para for para in list(self.inv_dyn.parameters()) + list(self.fwd_dyn.parameters())), lr=lr)
 
         encoder_lr = lr * encoder_lr_scale
         """ set up encoder optimizer """
-        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=encoder_lr)
+        self.visual_encoder_opt = torch.optim.Adam(self.visual_encoder.parameters(), lr=encoder_lr)
         # data augmentation
         self.aug = RandomShiftsAug(pad=4)
         self.train()
@@ -524,31 +596,33 @@ class TARAgent:
             else:
                 name = k
             pretrained_dict[name] = v
-        self.encoder.model.load_state_dict(pretrained_dict, strict=False)
+        self.visual_encoder.model.load_state_dict(pretrained_dict, strict=False)
     
     def expand_encoder(self, model_name):
         if model_name[:4] == 'vrl3':
             multiplier = self.n_images
-            self.encoder.model.conv1.weight.data = self.encoder.model.conv1.weight.data.repeat(1,multiplier,1,1) / multiplier
+            self.visual_encoder.model.conv1.weight.data = self.visual_encoder.model.conv1.weight.data.repeat(1,multiplier,1,1) / multiplier
             means = (0.485, 0.456, 0.406) * multiplier
             stds = (0.229, 0.224, 0.225) * multiplier
-            self.encoder.normalize_op = transforms.Normalize(means, stds)
-            self.encoder.channel_mismatch = False
+            self.visual_encoder.normalize_op = transforms.Normalize(means, stds)
+            self.visual_encoder.channel_mismatch = False
         elif model_name[:3] == 'r3m':
-            self.encoder.module.convnet.conv1.weight.data = self.encoder.module.convnet.conv1.weight.repeat(1, self.n_images, 1, 1) / self.n_images
+            self.visual_encoder.module.convnet.conv1.weight.data = self.visual_encoder.module.convnet.conv1.weight.repeat(1, self.n_images, 1, 1) / self.n_images
             means = (0.485, 0.456, 0.406) * self.n_images
             stds = (0.229, 0.224, 0.225) * self.n_images
-            self.encoder.module.normlayer = transforms.Normalize(means, stds)
+            self.visual_encoder.module.normlayer = transforms.Normalize(means, stds)
         else:
-            self.encoder.conv1.weight.data = self.encoder.conv1.weight.repeat(1, self.n_images, 1, 1) / self.n_images
+            self.visual_encoder.conv1.weight.data = self.visual_encoder.conv1.weight.repeat(1, self.n_images, 1, 1) / self.n_images
     
     def train(self, training=True):
         self.training = training
-        self.encoder.train(training)
+        self.visual_encoder.train(training)
+        self.action_encoder.train(training)
+        self.action_decoder.train(training)
         self.actor.train(training)
         self.critic.train(training)
 
-    def act(self, obs, step, eval_mode, obs_sensor=None, is_tensor_input=False, force_action_std=None):
+    def act(self, obs, step, eval_mode, obs_sensor=None, is_tensor_input=False, force_action_std=None, act_lim=1.0):
         # eval_mode should be False when taking an exploration action in stage 3
         # eval_mode should be True when evaluate agent performance
         if force_action_std == None:
@@ -560,10 +634,10 @@ class TARAgent:
             stddev = force_action_std
         obs = obs.astype(np.float32)
         if is_tensor_input:
-            obs = self.encoder(obs)
+            obs = self.visual_encoder(obs)
         else:
             obs = torch.as_tensor(obs, device=self.device)
-            obs = self.encoder(obs.unsqueeze(0))
+            obs = self.visual_encoder(obs.unsqueeze(0))
 
         if obs_sensor is not None:
             obs_sensor = torch.as_tensor(obs_sensor, device=self.device)
@@ -581,23 +655,78 @@ class TARAgent:
                 act_rep.uniform_(-1.0, 1.0)
         
         if self.policy_output_type == 'latent':
-            action = self.action_ae.decode(act_rep)[0]
-            action = torch.clamp(action, -1.0, 1.0)
+            action = self.action_decoder(act_rep)[0]
+            # action = torch.clamp(action, -1.0, 1.0)
         else:
             action = act_rep
         
         return action.cpu().numpy()[0]
     
-    def update_representation(self, replay_iter, traj_iter, step, use_sensor):
+    def compute_reconstruction_loss(self, action, id, update_encoder=True, update_decoder=True):
+        action_idx = torch.tensor(self.action_idx).to(self.device)
+        indices = torch.arange(action.shape[1]).unsqueeze(0).repeat(action.shape[0], 1).to(self.device)
+        rec_mask = ((indices >= action_idx[id.long()]) & (indices < action_idx[id.long()+1])).float().to(self.device)
+        
+        if not update_encoder:
+            for module in self.action_encoder.modules():
+                module.requires_grad = False
+        if not update_decoder:
+            for module in self.action_decoder.modules():
+                module.requires_grad = False
+                
+        action_rep = self.action_encoder(action)[0]
+        action_pred = self.action_decoder(action_rep)[0]
+        
+        action_pred_expand = action_pred.unsqueeze(0).repeat(self.num_embodiments,1,1)
+        
+        indices = torch.arange(action_pred.shape[1]).unsqueeze(0).unsqueeze(0).repeat(self.num_embodiments, 1, 1).to(self.device)
+        mask = ((indices >= action_idx[:self.num_embodiments, None, None]) & 
+                (indices < action_idx[1:self.num_embodiments+1, None, None])).repeat(1,action_pred.shape[0],1).float().to(self.device)
+        
+        action_pred_expand = action_pred_expand * mask
+        
+        action_pred_rep = self.action_encoder(action_pred_expand)[0]
+        action_rec = self.action_decoder(action_pred_rep)[0] * rec_mask
+        loss = torch.mean((action - action_rec)**2)
+        
+        if not update_encoder:
+            for module in self.action_encoder.modules():
+                module.requires_grad = True
+        if not update_decoder:
+            for module in self.action_decoder.modules():
+                module.requires_grad = True
+        
+        return loss
+    
+    def compute_inverse_dynamics_loss(self, obs, next_obs, action):
+        act_rec = self.inv_dyn(obs, next_obs)
+        loss = F.mse_loss(act_rec.detach(), action) + F.mse_loss(act_rec, action.detach())
+        
+        return loss
+        
+    def compute_forward_dynamics_loss(self, obs, action, next_obs):
+        obs_rec = self.fwd_dyn(obs, action)
+        loss = F.mse_loss(next_obs, obs_rec)
+        
+        return loss
+    
+    def compute_kl_loss(self, action):
+        mu, los_sigma = self.action_encoder(action)[1], self.action_encoder(action)[2]
+        loss = -0.5 * torch.sum(1 + los_sigma - mu.pow(2) - los_sigma.exp())
+        
+        return loss
+        
+    
+    def update_representation(self, replay_iter, step, use_sensor, update_decoder=True):
         
         metrics = dict()
         
         batch = next(replay_iter)
        
         if use_sensor: # TODO might want to...?
-            obs, action, reward, discount, next_obs, obs_sensor, obs_sensor_next = utils.to_torch(batch, self.device)
+            obs, action, reward, discount, next_obs, obs_sensor, obs_sensor_next, id = utils.to_torch(batch, self.device)
         else:
-            obs, action, reward, discount, next_obs = utils.to_torch(batch, self.device)
+            obs, action, reward, discount, next_obs, id = utils.to_torch(batch, self.device)
             
         # augment
         if self.use_data_aug:
@@ -605,98 +734,73 @@ class TARAgent:
             next_obs = self.aug(next_obs.float())
         
         with torch.no_grad():  
-            ob_rep = self.encoder(obs)
-            ob_rep_next = self.encoder(next_obs)
+            ob_rep = self.visual_encoder(obs)
+            ob_rep_next = self.visual_encoder(next_obs)
         
         if use_sensor:
             ob_rep = torch.cat([ob_rep, obs_sensor], dim=1)
             ob_rep_next = torch.cat([ob_rep_next, obs_sensor_next], dim=1)
 
-        act_rep = self.action_ae.encode(action)[0]
-        act_rec= self.action_ae.forward(action)[0]
-        
-        loss_rec = F.mse_loss(act_rec, action)
+        loss_rec = self.compute_reconstruction_loss(action, id, update_decoder)
 
+        act_rep = self.action_encoder(action)[0]
         if self.inv_weight > 0:
-            act_rep_rec = self.inv_dyn(ob_rep, ob_rep_next)
-            loss_inv = (F.mse_loss(act_rep_rec.detach(), act_rep) + F.mse_loss(act_rep_rec, act_rep.detach())) * self.inv_weight
+            loss_inv = self.compute_inverse_dynamics_loss(ob_rep, ob_rep_next, act_rep) * self.inv_weight
         else:
             loss_inv = 0
         
         if self.fwd_weight > 0:
-            ob_rep_pred = self.fwd_dyn(ob_rep, action)
-            loss_fwd = F.mse_loss(ob_rep_pred, ob_rep_next) * self.fwd_weight
-            
-        if self.cls_weight > 0:
-            batch_traj = next(traj_iter)
-            batch_seq, batch_label = utils.to_torch(batch_traj, self.device)
-            with torch.no_grad():
-                batch_seq_rep = self.action_ae.encode(batch_seq.reshape(-1, batch_seq.shape[-1]))[0]
-                batch_seq_rep = batch_seq_rep.reshape(batch_seq.shape[0],self.seq_len, self.act_rep_dim)
-            logits = self.task_cls(batch_seq_rep)
-            loss_cls = F.binary_cross_entropy_with_logits(logits, batch_label) * self.cls_weight
+            loss_fwd = self.compute_forward_dynamics_loss(ob_rep, act_rep, ob_rep_next) * self.fwd_weight
         else:
-            loss_cls = 0
+            loss_fwd = 0
             
-        if self.ficc_weight > 0:
-            # act_rep_rec = self.inv_dyn(ob_rep, ob_rep_next)
-            # ob_rep_next_rec = self.fwd_dyn(ob_rep, act_rep_rec)
-            # loss_ficc = F.mse_loss(ob_rep_next_rec, ob_rep_next) * self.ficc_weight
-            ob_rep_next_rec = self.fwd_dyn(ob_rep, act_rep.detach())
-            act_rep_rec = self.inv_dyn(ob_rep, self.fwd_dyn(ob_rep, act_rep))
-            loss_act_rec = F.mse_loss(act_rep_rec, act_rep)
-            loss_ob_rep_next_rec = F.mse_loss(ob_rep_next_rec, ob_rep_next)
-            loss_ficc = (loss_act_rec + loss_ob_rep_next_rec) * self.ficc_weight
+        if not self.deterministic_encoder and self.kl_weight > 0:
+            loss_kl = self.compute_kl_loss(action) * self.kl_weight
         else:
-            loss_ficc = 0
+            loss_kl = 0
         
-        loss = loss_rec + loss_cls + loss_inv + loss_fwd + loss_ficc
+        loss = loss_rec + loss_inv + loss_fwd + loss_kl
         
-        metrics['loss_rec'] = loss_rec.item()
-        metrics['loss_cls'] = loss_cls.item() if self.cls_weight > 0 else 0
-        metrics['loss_inv'] = loss_inv.item() if self.inv_weight > 0 else 0
-        metrics['loss_ficc_act'] = loss_act_rec.item() * self.ficc_weight if self.ficc_weight > 0 else 0
-        metrics['loss_ficc_ob'] = loss_ob_rep_next_rec.item() * self.ficc_weight if self.ficc_weight > 0 else 0
-        metrics['loss_ficc'] = loss_ficc.item() if self.ficc_weight > 0 else 0
+        metrics['loss_rec_pretrain'] = loss_rec.item()
+        metrics['loss_inv_pretrain'] = loss_inv.item() if self.inv_weight > 0 else 0
+        metrics['loss_fwd_pretrain'] = loss_fwd.item() if self.fwd_weight > 0 else 0
+        metrics['loss_kl_pretrain'] = loss_kl.item() if (self.deterministic_encoder and self.kl_weight > 0) else 0
         
-        self.action_ae_opt.zero_grad()
-        if self.cls_weight > 0:
-            self.task_cls_opt.zero_grad()
+        self.action_encoder.zero_grad()
+        self.action_decoder.zero_grad()
         if self.inv_weight > 0:
             self.inv_dyn_opt.zero_grad()
         if self.fwd_weight > 0:
-            self.fwd_dyn_opt.zero_grad()
-        if self.ficc_weight > 0:
-            self.ficc_opt.zero_grad()
-            
+            self.fwd_dyn_opt.zero_grad()  
         loss.backward()
-        self.action_ae_opt.step()
-        if self.cls_weight > 0:
-            self.task_cls_opt.step()
+        self.action_encoder_opt.step()
+        self.action_decoder_opt.step()
         if self.inv_weight > 0:
             self.inv_dyn_opt.step()
-        if self.ficc_weight > 0:
-            self.ficc_opt.step()
+        if self.fwd_weight > 0:
+            self.fwd_dyn_opt.step()
+            
         return metrics
 
     def update(self, replay_iter, step, stage, use_sensor):
         # for stage 2 and 3, we use the same functions but with different hyperparameters
         assert stage in ["BC", "DAPG"]
         metrics = dict()
-        self.action_ae.eval()
 
         if stage == "BC":
-            update_encoder = self.stage2_update_encoder
+            update_visual_encoder = self.stage2_update_visual_encoder
             stddev = self.stage2_std
             conservative_loss_weight = self.cql_weight
             bc_weight = self.stage2_bc_weight
-            update_autoencoder = self.stage2_update_autoencoder
+            update_encoder = self.stage2_update_encoder
+            update_decoder = self.stage2_update_decoder
 
         if stage == "DAPG":
             if step % self.update_every_steps != 0:
                 return metrics
+            update_visual_encoder = self.stage3_update_visual_encoder
             update_encoder = self.stage3_update_encoder
-            update_autoencoder = self.stage3_update_autoencoder
+            update_decoder = self.stage3_update_decoder
             stddev = utils.schedule(self.stddev_schedule, step)
             conservative_loss_weight = 0
 
@@ -707,10 +811,11 @@ class TARAgent:
 
         # batch data
         batch = next(replay_iter)
+        
         if use_sensor: # TODO might want to...?
-            obs, action, reward, discount, next_obs, obs_sensor, obs_sensor_next = utils.to_torch(batch, self.device)
+            obs, action, reward, discount, next_obs, obs_sensor, obs_sensor_next, id = utils.to_torch(batch, self.device)
         else:
-            obs, action, reward, discount, next_obs = utils.to_torch(batch, self.device)
+            obs, action, reward, discount, next_obs, id = utils.to_torch(batch, self.device)
             obs_sensor, obs_sensor_next = None, None
 
         # augment
@@ -722,43 +827,74 @@ class TARAgent:
             next_obs = next_obs.float()
 
         # encode
-        if update_encoder:
-            obs = self.encoder(obs)
-        else:
-            with torch.no_grad():
-                obs = self.encoder(obs)
+        # if update_visual_encoder:
+        #     obs = self.visual_encoder(obs)
+        # else:
+        #     with torch.no_grad():
+        #         obs = self.visual_encoder(obs)
 
         with torch.no_grad():
-            next_obs = self.encoder(next_obs)
-            act_rep = self.action_ae.encode(action)[0]
-        if update_autoencoder:
-            act_rec = self.action_ae.forward(action)[0]
-        else:
-            with torch.no_grad():
-                act_rec = self.action_ae.forward(action)[0]
-        
-        loss_rec_rl = F.mse_loss(act_rec, action)
-        metrics['loss_rec_rl'] = F.mse_loss(act_rec, action).item()
-        if update_autoencoder:
-            self.action_ae_opt.zero_grad()
-            loss_rec_rl.backward()
-            self.action_ae_opt.step()
-            
+            obs = self.visual_encoder(obs)
+            next_obs = self.visual_encoder(next_obs)
 
+        act_rep = self.action_encoder(action)[0]    
+        
+        loss_rec = self.compute_reconstruction_loss(action, id, update_encoder, update_decoder)
+        
+        if update_encoder or update_decoder or self.inv_weight > 0:
+            act_rep_rec = self.inv_dyn(obs, next_obs)
+            loss_inv = (F.mse_loss(act_rep_rec.detach(), act_rep) + F.mse_loss(act_rep_rec, act_rep.detach())) * self.inv_weight
+        else:
+            loss_inv = 0
+        
+        if update_encoder or update_decoder or self.fwd_weight > 0:
+            next_obs_fwd = self.fwd_dyn(obs, act_rep)
+            loss_fwd = F.mse_loss(next_obs_fwd, next_obs) * self.fwd_weight
+        else:
+            loss_fwd = 0
+            
+        loss = loss_rec + loss_inv + loss_fwd
+        
+        metrics['loss_rec_rl'] = loss_rec.item()
+        metrics['loss_inv_rl'] = loss_inv.item() if update_encoder or update_decoder or self.inv_weight > 0 else 0
+        metrics['loss_fwd_rl'] = loss_fwd.item() if update_encoder or update_decoder or self.fwd_weight > 0 else 0
+        
+        if update_encoder:
+            self.action_encoder_opt.zero_grad()
+            if update_decoder:
+                self.action_decoder_opt.zero_grad()
+            # if update_visual_encoder:
+            #     self.visual_encoder_opt.zero_grad()
+            if self.inv_weight > 0:
+                self.inv_dyn_opt.zero_grad()
+            if self.fwd_weight > 0:
+                self.fwd_dyn_opt.zero_grad()
+            loss.backward()
+            self.action_encoder_opt.step()
+            if update_decoder:
+                self.action_decoder_opt.step()
+            # if update_visual_encoder:
+            #     self.visual_encoder_opt.step()
+            if self.inv_weight > 0:
+                self.inv_dyn_opt.step()
+            if self.fwd_weight > 0:
+                self.fwd_dyn_opt.step()
+
+        
         # concatenate obs with additional sensor observation if needed
         obs_combined = torch.cat([obs, obs_sensor], dim=1) if obs_sensor is not None else obs
         obs_next_combined = torch.cat([next_obs, obs_sensor_next], dim=1) if obs_sensor_next is not None else next_obs
 
         # update critic
-        metrics.update(self.update_critic(obs_combined, act_rep, reward, discount, obs_next_combined,
-                                               stddev, update_encoder, conservative_loss_weight))
+        metrics.update(self.update_critic(obs_combined, act_rep.detach(), reward, discount, obs_next_combined,
+                                               stddev, update_visual_encoder, conservative_loss_weight))
 
         # update actor, following previous works, we do not use actor gradient for encoder update
         if self.policy_output_type == "action":
             metrics.update(self.update_actor(obs_combined.detach(), action, stddev, bc_weight,
                                                   self.pretanh_penalty, self.pretanh_threshold))
         else:
-            metrics.update(self.update_actor(obs_combined.detach(), act_rep, stddev, bc_weight,
+            metrics.update(self.update_actor(obs_combined.detach(), act_rep.detach(), stddev, bc_weight,
                                               self.pretanh_penalty, self.pretanh_threshold))
 
         metrics['batch_reward'] = reward.mean().item()
@@ -767,7 +903,7 @@ class TARAgent:
         utils.soft_update_params(self.critic, self.critic_target, self.critic_target_tau)
         return metrics
 
-    def update_critic(self, obs, action, reward, discount, next_obs, stddev, update_encoder, conservative_loss_weight):
+    def update_critic(self, obs, action, reward, discount, next_obs, stddev, update_visual_encoder, conservative_loss_weight):
         metrics = dict()
         batch_size = obs.shape[0]
 
@@ -780,7 +916,7 @@ class TARAgent:
             dist = self.actor(next_obs, stddev)
             next_action = dist.sample(clip=self.stddev_clip)
             if self.policy_output_type == 'action': 
-                next_action = self.action_ae.encode(next_action)[0]
+                next_action = self.action_encoder(next_action)[0]
             target_Q1, target_Q2 = self.critic_target(next_obs, next_action)
             target_V = torch.min(target_Q1, target_Q2)
             target_Q = reward + (discount * target_V)
@@ -799,7 +935,7 @@ class TARAgent:
         """
         if conservative_loss_weight > 0:
             random_actions = (torch.rand((batch_size * self.cql_n_random, self.act_dim), device=self.device) - 0.5) * 2
-            random_actions = self.action_ae.encode(random_actions)[0]
+            random_actions = self.action_encoder(random_actions)[0]
 
             dist = self.actor(obs, stddev)
             current_actions = dist.sample(clip=self.stddev_clip)
@@ -808,8 +944,8 @@ class TARAgent:
             next_current_actions = dist.sample(clip=self.stddev_clip)
             
             if self.policy_output_type == 'action': 
-                current_actions = self.action_ae.encode(current_actions)[0]
-                next_current_actions = self.action_ae.encode(next_current_actions)[0]
+                current_actions = self.action_encoder(current_actions)[0]
+                next_current_actions = self.action_encoder(next_current_actions)[0]
 
             # now get Q values for all these actions (for both Q networks)
             obs_repeat = obs.unsqueeze(1).repeat(1, self.cql_n_random, 1).view(obs.shape[0] * self.cql_n_random,
@@ -845,13 +981,13 @@ class TARAgent:
         metrics['critic_loss'] = critic_loss.item()
 
         # if needed, also update encoder with critic loss
-        if update_encoder:
-            self.encoder_opt.zero_grad(set_to_none=True)
+        if update_visual_encoder:
+            self.visual_encoder_opt.zero_grad(set_to_none=True)
         self.critic_opt.zero_grad(set_to_none=True)
         critic_loss_combined.backward()
         self.critic_opt.step()
-        if update_encoder:
-            self.encoder_opt.step()
+        if update_visual_encoder:
+            self.visual_encoder_opt.step()
 
         return metrics
 
@@ -865,7 +1001,7 @@ class TARAgent:
         current_action = dist.sample(clip=self.stddev_clip)
         log_prob = dist.log_prob(current_action).sum(-1, keepdim=True)
         if self.policy_output_type == 'action':
-            current_action = self.action_ae.encode(current_action)[0]
+            current_action = self.action_encoder(current_action)[0]
         Q1, Q2 = self.critic(obs, current_action)
         Q = torch.min(Q1, Q2)
         actor_loss = -Q.mean()
@@ -908,73 +1044,6 @@ class TARAgent:
         metrics['max_abs_pretanh'] = pretanh.abs().max().item()
 
         return metrics
-
-
-class Identity(nn.Module):
-    def __init__(self, input_placeholder=None):
-        super(Identity, self).__init__()
-
-    def forward(self, x):
-        return x
-
-class Stage3ShallowEncoder(nn.Module):
-    def __init__(self, obs_shape, n_channel):
-        super().__init__()
-
-        assert len(obs_shape) == 3
-        self.repr_dim = n_channel * 35 * 35
-
-        self.n_input_channel = obs_shape[0]
-        self.conv1 = nn.Conv2d(obs_shape[0], n_channel, 3, stride=2)
-        self.conv2 = nn.Conv2d(n_channel, n_channel, 3, stride=1)
-        self.conv3 = nn.Conv2d(n_channel, n_channel, 3, stride=1)
-        self.conv4 = nn.Conv2d(n_channel, n_channel, 3, stride=1)
-        self.relu = nn.ReLU(inplace=True)
-
-        # TODO here add prediction head so we can do contrastive learning...
-
-        self.apply(utils.weight_init)
-        self.normalize_op = transforms.Normalize((0.485, 0.456, 0.406, 0.485, 0.456, 0.406, 0.485, 0.456, 0.406),
-                                                 (0.229, 0.224, 0.225, 0.229, 0.224, 0.225, 0.229, 0.224, 0.225))
-
-        self.compress = nn.Sequential(nn.Linear(self.repr_dim, 50), nn.LayerNorm(50), nn.Tanh())
-        self.pred_layer = nn.Linear(50, 50, bias=False)
-
-    def transform_obs_tensor_batch(self, obs):
-        # transform obs batch before put into the pretrained resnet
-        # correct order might be first augment, then resize, then normalize
-        # obs = F.interpolate(obs, size=self.pretrained_model_input_size)
-        new_obs = obs / 255.0 - 0.5
-        # new_obs = self.normalize_op(new_obs)
-        return new_obs
-
-    def _forward_impl(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = self.relu(self.conv3(x))
-        x = self.relu(self.conv4(x))
-        return x
-
-    def forward(self, obs):
-        o = self.transform_obs_tensor_batch(obs)
-        h = self._forward_impl(o)
-        h = h.view(h.shape[0], -1)
-        return h
-
-    def get_anchor_output(self, obs, actions=None):
-        # typically go through conv and then compression layer and then a mlp
-        # used for UL update
-        conv_out = self.forward(obs)
-        compressed = self.compress(conv_out)
-        pred = self.pred_layer(compressed)
-        return pred, conv_out
-
-    def get_positive_output(self, obs):
-        # typically go through conv, compression
-        # used for UL update
-        conv_out = self.forward(obs)
-        compressed = self.compress(conv_out)
-        return compressed
 
 class Encoder(nn.Module):
     def __init__(self, obs_shape, n_channel):
